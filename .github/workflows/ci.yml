@@ -38,7 +38,19 @@ jobs:
         run: cargo test
 
       - name: Build release
+        if: runner.os != 'macOS'
         run: cargo build --release
+
+      # One "universal" program that runs on both Apple Silicon and Intel Macs.
+      - name: Build release (universal macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create -output target/release/emuhub \
+            target/aarch64-apple-darwin/release/emuhub target/x86_64-apple-darwin/release/emuhub
+          lipo -info target/release/emuhub
 
       - uses: actions/upload-artifact@v4
         with:
