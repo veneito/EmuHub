@@ -12,5 +12,6 @@
   { "id": "genesis",     "name": "Sega Genesis",     "exts": ["md", "gen", "bin", "zip"],        "core": "genesis_plus_gx",   "thumbs": "Sega - Mega Drive - Genesis" },
   { "id": "segacd",      "name": "Sega CD",          "exts": ["cue", "chd", "m3u"],              "core": "genesis_plus_gx",   "thumbs": "Sega - Mega-CD - Sega CD" },
   { "id": "pcengine",    "name": "TurboGrafx-16",    "exts": ["pce", "cue", "chd", "zip"],       "core": "mednafen_pce_fast", "thumbs": "NEC - PC Engine - TurboGrafx 16" },
+  { "id": "switch",      "name": "Nintendo Switch",  "exts": ["xci", "nsp", "nsz", "xcz"],       "standalone": "eden",          "thumbs": "" },
   { "id": "psx",         "name": "PlayStation",      "exts": ["cue", "chd", "pbp", "m3u"],       "core": "swanstation",       "thumbs": "Sony - PlayStation" }
 ]

@@ -1,5 +1,6 @@
 //! Controller input. gilrs runs on its own thread and queues simple UI actions for the window to drain.
 use gilrs::{Axis, Button, EventType, Gilrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -18,6 +19,14 @@ pub enum Pad {
 
 pub type Queue = Arc<Mutex<Vec<Pad>>>;
 
+/// Whether the last controller used is a PlayStation one, so button hints show ✕ ◯ instead of A B.
+pub static PLAYSTATION: AtomicBool = AtomicBool::new(false);
+
+fn is_playstation(name: &str) -> bool {
+    let name = name.to_lowercase();
+    ["playstation", "dualshock", "dualsense", "ps4", "ps5", "sony", "wireless controller"].iter().any(|n| name.contains(n))
+}
+
 /// Starts listening for controllers. If gilrs can't start (no input backend), the queue just stays empty.
 pub fn spawn() -> Queue {
     let queue: Queue = Arc::default();
@@ -27,6 +36,9 @@ pub fn spawn() -> Queue {
         let mut stick = Stick::default();
         loop {
             let Some(event) = gilrs.next_event_blocking(None) else { continue };
+            if let Some(pad) = gilrs.connected_gamepad(event.id) {
+                PLAYSTATION.store(is_playstation(pad.name()), Ordering::Relaxed);
+            }
             if let Some(action) = map(event.event, &mut stick) {
                 out.lock().unwrap().push(action);
             }

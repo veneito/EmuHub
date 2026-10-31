@@ -18,6 +18,10 @@ const ICONS: &[(&str, &str)] = &[
     ("folder", r#"<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>"#),
     ("terminal", r#"<path d="m5 8 5 4-5 4M12 17h7"/>"#),
     ("refresh", r#"<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>"#),
+    // Controller button glyphs for the hints bar.
+    ("btn-cross", r#"<path d="m7 7 10 10M17 7 7 17"/>"#),
+    ("btn-circle", r#"<circle cx="12" cy="12" r="6.5"/>"#),
+    ("btn-menu", r#"<path d="M6 8h12M6 12h12M6 16h12"/>"#),
 ];
 
 pub struct Assets;

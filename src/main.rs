@@ -19,6 +19,7 @@ const FONT: &str = if cfg!(target_os = "windows") { "Segoe UI" } else { ".System
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
+    Home,
     Library,
     Settings,
 }
@@ -29,11 +30,23 @@ enum Focus {
     Menu(usize),
     Grid,
     Settings(usize),
+    /// Home page: (row, column). Row 0 is Continue Playing, row 1 is Systems.
+    Home(usize, usize),
 }
 
-/// One side-menu entry: a library filter (None = all games) or Settings.
+/// A button shown in the bottom bar's hints.
+#[derive(Clone, Copy)]
+enum Hint {
+    Confirm,
+    Back,
+    Options,
+    Bumpers,
+}
+
+/// One side-menu entry: Home, a library filter (None = all games), or Settings.
 #[derive(Clone, PartialEq)]
 enum MenuItem {
+    Home,
     Library(Option<String>),
     Settings,
 }
@@ -46,6 +59,10 @@ enum Setting {
     Cores,
     Glass(bool),
     Palette(usize),
+    /// Pick the program for emu::EMULATORS[i].
+    PickEmulator(usize),
+    /// Open emu::EMULATORS[i]'s official site.
+    EmulatorSite(usize),
 }
 
 /// The game details window (right-click or Options). `focus` walks Play, Change cover, Close, then the cover choices.
@@ -67,18 +84,16 @@ const PALETTES: [(&str, u32, u32); 5] = [
     ("Forest", 0x101f19, 0x91cba6),
 ];
 
-const SETTINGS: [Setting; 10] = [
-    Setting::RomFolders,
-    Setting::RetroArch,
-    Setting::Cores,
-    Setting::Glass(false),
-    Setting::Glass(true),
-    Setting::Palette(0),
-    Setting::Palette(1),
-    Setting::Palette(2),
-    Setting::Palette(3),
-    Setting::Palette(4),
-];
+/// The Settings buttons a controller can reach, in on-screen order: Setup, Emulators, Appearance.
+fn settings_items() -> Vec<Setting> {
+    let mut items = vec![Setting::RomFolders, Setting::RetroArch, Setting::Cores];
+    for i in 0..emu::EMULATORS.len() {
+        items.extend([Setting::PickEmulator(i), Setting::EmulatorSite(i)]);
+    }
+    items.extend([Setting::Glass(false), Setting::Glass(true)]);
+    items.extend((0..PALETTES.len()).map(Setting::Palette));
+    items
+}
 
 struct Hub {
     query: Entity<InputState>,
@@ -103,6 +118,10 @@ struct Hub {
     /// Cards per grid row, measured each frame for up/down navigation.
     columns: usize,
     grid_scroll: ScrollHandle,
+    /// Horizontal scroll of the Home rows, so the controller's card stays in view.
+    home_scroll: [ScrollHandle; 2],
+    /// When each game was last played, for Continue Playing.
+    history: std::collections::HashMap<std::path::PathBuf, u64>,
     message: String,
     appearance: appearance::Appearance,
 }
@@ -231,7 +250,7 @@ impl Hub {
             systems: emu::systems(),
             games: vec![],
             config,
-            view: View::Library,
+            view: View::Home,
             system: None,
             selected: None,
             sidebar_open: true,
@@ -242,6 +261,8 @@ impl Hub {
             active: true,
             columns: 1,
             grid_scroll: ScrollHandle::new(),
+            home_scroll: [ScrollHandle::new(), ScrollHandle::new()],
+            history: emu::load_history(),
             message: String::new(),
             appearance,
         };
@@ -276,11 +297,18 @@ impl Hub {
     /// Downloads missing covers one by one in the background, redrawing as each arrives.
     fn fetch_covers(&self, cx: &mut Context<Self>) {
         let games = self.games.clone();
+        let recent: Vec<Game> = self.recent().into_iter().map(|i| self.games[i].clone()).collect();
         let key = self.config.steamgriddb_key.clone();
         cx.spawn(async move |this, cx| {
             for game in games {
                 let key = key.clone();
                 let got = cx.background_executor().spawn(async move { emu::fetch_cover(&game, &key) }).await;
+                if got && this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+            for game in recent {
+                let got = cx.background_executor().spawn(async move { emu::fetch_snap(&game) }).await;
                 if got && this.update(cx, |_, cx| cx.notify()).is_err() {
                     return;
                 }
@@ -295,12 +323,20 @@ impl Hub {
             Ok(()) => format!("Launched {}", game.name),
             Err(error) => error,
         };
+        self.history = emu::load_history();
+        let game = game.clone();
+        cx.spawn(async move |this, cx| {
+            if cx.background_executor().spawn(async move { emu::fetch_snap(&game) }).await {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
         cx.notify();
     }
 
     /// Side-menu entries in order: All games, each system that has games, Settings.
     fn menu(&self) -> Vec<MenuItem> {
-        let mut items = vec![MenuItem::Library(None)];
+        let mut items = vec![MenuItem::Home, MenuItem::Library(None)];
         items.extend(
             self.systems
                 .iter()
@@ -314,6 +350,7 @@ impl Hub {
     /// The menu entry for the page on screen.
     fn current_menu(&self) -> usize {
         let here = match self.view {
+            View::Home => MenuItem::Home,
             View::Settings => MenuItem::Settings,
             View::Library => MenuItem::Library(self.system.clone()),
         };
@@ -322,6 +359,7 @@ impl Hub {
 
     fn show(&mut self, item: &MenuItem) {
         match item {
+            MenuItem::Home => self.view = View::Home,
             MenuItem::Settings => self.view = View::Settings,
             MenuItem::Library(system) => {
                 if self.view != View::Library || self.system != *system {
@@ -362,12 +400,15 @@ impl Hub {
                 self.show(&menu[i]);
                 if menu[i] == MenuItem::Settings {
                     self.focus = Focus::Settings(0);
+                } else if menu[i] == MenuItem::Home {
+                    self.enter_home();
                 } else if !self.visible(cx).is_empty() {
                     self.focus = Focus::Grid;
                     self.move_selection(0, cx);
                 }
             }
             (Focus::Menu(_), _) => {}
+            (Focus::Home(row, col), _) => self.home_pad(row, col, action, cx),
             // Game grid: Left from the first column, or O, returns to the menu.
             (Focus::Grid, Pad::Back) => self.focus = Focus::Menu(self.current_menu()),
             (Focus::Grid, Pad::Left) if self.grid_position(cx).is_none_or(|p| p % self.columns == 0) => {
@@ -389,8 +430,8 @@ impl Hub {
             // Settings: up/down through the buttons, X presses, O or Left returns to the menu.
             (Focus::Settings(_), Pad::Back | Pad::Left) => self.focus = Focus::Menu(self.current_menu()),
             (Focus::Settings(j), Pad::Up) => self.focus = Focus::Settings(j.saturating_sub(1)),
-            (Focus::Settings(j), Pad::Down) => self.focus = Focus::Settings((j + 1).min(SETTINGS.len() - 1)),
-            (Focus::Settings(j), Pad::Confirm) => self.apply_setting(SETTINGS[j], window, cx),
+            (Focus::Settings(j), Pad::Down) => self.focus = Focus::Settings((j + 1).min(settings_items().len() - 1)),
+            (Focus::Settings(j), Pad::Confirm) => self.apply_setting(settings_items()[j], window, cx),
             (Focus::Settings(_), Pad::Right | Pad::Options) => {}
         }
         cx.notify();
@@ -587,6 +628,29 @@ impl Hub {
                 self.appearance.glass = glass;
                 self.save_appearance(window, cx);
             }
+            Setting::PickEmulator(i) => {
+                let emulator = &emu::EMULATORS[i];
+                let picked = cx.prompt_for_paths(PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: false,
+                    prompt: Some(format!("Choose the {} program", emulator.name).into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Ok(Some(mut paths))) = picked.await {
+                        let _ = this.update(cx, |view, cx| {
+                            view.config.emulators.insert(emulator.id.to_owned(), paths.remove(0));
+                            view.message = match view.config.save() {
+                                Ok(()) => format!("{} set.", emulator.name),
+                                Err(error) => error,
+                            };
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }
+            Setting::EmulatorSite(i) => self.message = emu::open_url(emu::EMULATORS[i].site).err().unwrap_or_default(),
             Setting::Palette(i) => {
                 let (_, surface, accent) = PALETTES[i];
                 self.appearance.surface = surface;
@@ -605,7 +669,7 @@ impl Hub {
 
     /// A Settings button wrapped in its focus ring.
     fn setting_button(&self, setting: Setting, button: Button, cx: &mut Context<Self>) -> Div {
-        let focused = self.focus == Focus::Settings(SETTINGS.iter().position(|s| *s == setting).unwrap());
+        let focused = self.focus == Focus::Settings(settings_items().iter().position(|s| *s == setting).unwrap());
         self.ring(div().rounded_md(), focused)
             .child(button.on_click(cx.listener(move |view, _, window, cx| view.apply_setting(setting, window, cx))))
     }
@@ -682,12 +746,22 @@ impl Hub {
         let settings = self.view == View::Settings;
         let menu_len = self.menu().len();
         let focused = |i: usize| self.focus == Focus::Menu(i);
+        let home = self.view == View::Home;
         let mut nav = div()
             .flex()
             .flex_col()
             .gap_1()
             .child(
-                self.ring(self.nav_row("nav-all", all), focused(0))
+                self.ring(self.nav_row("nav-home", home), focused(0))
+                    .child(icon("home", 18., tone(home)))
+                    .child("Home")
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.view = View::Home;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                self.ring(self.nav_row("nav-all", all), focused(1))
                     .child(icon("library", 18., tone(all)))
                     .child(div().flex_1().child("All games"))
                     .child(div().text_xs().text_color(rgb(MUTED)).child(self.games.len().to_string()))
@@ -698,7 +772,7 @@ impl Hub {
                     })),
             )
             .child(div().px_3().pt_3().pb_1().child(heading("Your Library")));
-        let mut row = 0;
+        let mut row = 1;
         for system in &self.systems {
             let count = self.games.iter().filter(|g| g.system == system.id).count();
             if count == 0 {
@@ -909,6 +983,25 @@ impl Hub {
                 )),
             );
 
+        let mut emulators = card();
+        for (i, emulator) in emu::EMULATORS.iter().enumerate() {
+            let systems: Vec<&str> =
+                self.systems.iter().filter(|s| s.standalone == emulator.id).map(|s| s.name.as_str()).collect();
+            let note = match emu::find_emulator(&self.config, emulator) {
+                Some(path) => format!("Found: {}", path.display()),
+                None => format!("Not found. Install it from its website, then choose its program ({}).", if cfg!(target_os = "windows") { "eden.exe" } else { "eden" }),
+            };
+            emulators = emulators.child(
+                setting_row(&format!("{} ({})", emulator.name, systems.join(", ")), &note).child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(self.setting_button(Setting::PickEmulator(i), Button::new(("pick-emu", i)).label("Choose…"), cx))
+                        .child(self.setting_button(Setting::EmulatorSite(i), Button::new(("emu-site", i)).label("Website"), cx)),
+                ),
+            );
+        }
+
         let mut modes = div().flex().gap_2();
         for (label, glass) in [("Solid", false), ("Glass", true)] {
             modes = modes.child(self.setting_button(
@@ -942,6 +1035,8 @@ impl Hub {
             // Controller-reachable sections first; Paths needs a keyboard anyway.
             .child(div().pt_4().child(heading("Setup")))
             .child(setup)
+            .child(div().pt_4().child(heading("Emulators")))
+            .child(emulators)
             .child(div().pt_4().child(heading("Appearance")))
             .child(looks)
             .child(div().pt_4().child(heading("Paths")))
@@ -958,7 +1053,275 @@ impl Hub {
         cx.notify();
     }
 
-    fn bottom_bar(&self, cx: &mut Context<Self>) -> Div {
+    // ---- home -------------------------------------------------------------
+
+    /// Played games, most recent first (the Continue Playing row).
+    fn recent(&self) -> Vec<usize> {
+        let mut played: Vec<(u64, usize)> =
+            self.games.iter().enumerate().filter_map(|(i, g)| self.history.get(&g.path).map(|&t| (t, i))).collect();
+        played.sort_by(|a, b| b.0.cmp(&a.0));
+        played.into_iter().take(12).map(|(_, i)| i).collect()
+    }
+
+    /// Systems that have games (the Systems row).
+    fn home_systems(&self) -> Vec<&System> {
+        self.systems.iter().filter(|s| self.games.iter().any(|g| g.system == s.id)).collect()
+    }
+
+    fn home_row_len(&self, row: usize) -> usize {
+        if row == 0 { self.recent().len() } else { self.home_systems().len() }
+    }
+
+    /// First Home row with something in it, for entering Home with the controller.
+    fn enter_home(&mut self) {
+        if let Some(row) = (0..2).find(|&r| self.home_row_len(r) > 0) {
+            self.focus = Focus::Home(row, 0);
+            self.home_scroll[row].scroll_to_item(0);
+        }
+    }
+
+    fn home_pad(&mut self, row: usize, col: usize, action: Pad, cx: &mut Context<Self>) {
+        let len = self.home_row_len(row);
+        match action {
+            Pad::Back => self.focus = Focus::Menu(self.current_menu()),
+            Pad::Left if col == 0 => self.focus = Focus::Menu(self.current_menu()),
+            Pad::Left | Pad::Right => {
+                let col = if action == Pad::Left { col - 1 } else { (col + 1).min(len.saturating_sub(1)) };
+                self.focus = Focus::Home(row, col);
+                self.home_scroll[row].scroll_to_item(col);
+            }
+            Pad::Up | Pad::Down => {
+                let other = 1 - row;
+                let other_len = self.home_row_len(other);
+                if other_len > 0 {
+                    let col = col.min(other_len - 1);
+                    self.focus = Focus::Home(other, col);
+                    self.home_scroll[other].scroll_to_item(col);
+                }
+            }
+            Pad::Confirm if row == 0 => {
+                if let Some(&game) = self.recent().get(col) {
+                    self.play(game, cx);
+                }
+            }
+            Pad::Options if row == 0 => {
+                if let Some(&game) = self.recent().get(col) {
+                    self.open_details(game, cx);
+                }
+            }
+            Pad::Confirm => {
+                if let Some(id) = self.home_systems().get(col).map(|s| s.id.clone()) {
+                    self.show(&MenuItem::Library(Some(id)));
+                    self.focus = Focus::Grid;
+                    self.move_selection(0, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Cover art, or the letter tile when there isn't any yet.
+    fn cover(&self, game: &Game, size: f32) -> AnyElement {
+        let cover = emu::cover_path(game);
+        if cover.exists() {
+            img(cover).size_full().object_fit(ObjectFit::Cover).into_any_element()
+        } else {
+            tile(&game.name, size).size_full().rounded_none().into_any_element()
+        }
+    }
+
+    fn home_page(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let recent = self.recent();
+        let hero = match self.focus {
+            Focus::Home(0, c) => recent.get(c),
+            _ => recent.first(),
+        }
+        .map(|&i| &self.games[i]);
+
+        // Hero: in-game screenshot on the left, title and facts on the right, like the old EmuHub's showcase.
+        let hero_art = match hero {
+            Some(game) if emu::snap_path(game).exists() => {
+                img(emu::snap_path(game)).size_full().object_fit(ObjectFit::Cover).into_any_element()
+            }
+            // No screenshot yet: show the whole box, centered, rather than a stretched crop of it.
+            Some(game) => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000040))
+                .child(div().w(px(180.)).h(px(270.)).rounded_lg().overflow_hidden().child(self.cover(game, 180.)))
+                .into_any_element(),
+            None => tile("EmuHub", 280.).size_full().rounded_none().into_any_element(),
+        };
+        let (title, facts) = match hero {
+            Some(game) => (
+                game.name.clone(),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_x_5()
+                    .gap_y_2()
+                    .text_color(rgb(MUTED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(icon("history", 16., rgb(MUTED)))
+                            .child(self.history.get(&game.path).map(|&t| emu::ago(t)).unwrap_or_default()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(icon("library", 16., rgb(MUTED)))
+                            .child(system_name(&self.systems, &game.system).to_owned()),
+                    ),
+            ),
+            None => (
+                "Welcome to EmuHub".to_owned(),
+                div().text_color(rgb(MUTED)).text_center().child("Games you play show up here. Pick one from All games to start."),
+            ),
+        };
+        let hero = div()
+            .flex()
+            .h(px(300.))
+            .flex_none()
+            .child(div().w(relative(0.6)).h_full().overflow_hidden().child(hero_art))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .p_8()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_4()
+                    .child(div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).text_center().line_clamp(2).child(title))
+                    .child(facts),
+            );
+
+        let accent = self.appearance.accent;
+        let row_title = |text: &str, sub: Option<&str>| {
+            let mut title = div().flex().gap_2().text_size(px(17.)).child(text.to_owned());
+            if let Some(sub) = sub {
+                title = title.child(div().text_color(rgb(MUTED)).truncate().child(format!("- {sub}")));
+            }
+            div().px_6().pt_5().pb_2().child(title)
+        };
+
+        let mut continue_row = div().id("recent-row").flex().gap_4().px_6().pb_2().overflow_x_scroll().track_scroll(&self.home_scroll[0]);
+        for (col, &index) in recent.iter().enumerate() {
+            let game = &self.games[index];
+            continue_row = continue_row.child(
+                self.ring(div().id(("recent", col)).w(px(120.)).h(px(180.)).flex_none().rounded_lg().overflow_hidden(), self.focus == Focus::Home(0, col))
+                    .cursor_pointer()
+                    .bg(rgba(0xffffff0a))
+                    .child(self.cover(game, 120.))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                            view.focus = Focus::Home(0, col);
+                            view.open_details(index, cx);
+                        }),
+                    )
+                    .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
+                        view.focus = Focus::Home(0, col);
+                        view.selected = Some(index);
+                        if event.click_count() >= 2 {
+                            view.play(index, cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut systems_row = div().id("systems-row").flex().gap_4().px_6().pb_6().overflow_x_scroll().track_scroll(&self.home_scroll[1]);
+        for (col, system) in self.home_systems().into_iter().enumerate() {
+            let count = self.games.iter().filter(|g| g.system == system.id).count();
+            let id = system.id.clone();
+            systems_row = systems_row.child(
+                self.ring(div().id(("system", col)).w(px(150.)).h(px(110.)).flex_none().rounded_lg(), self.focus == Focus::Home(1, col))
+                    .cursor_pointer()
+                    .bg(rgba(0xffffff0a))
+                    .hover(|style| style.bg(rgba(0xffffff14)))
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .child(tile(&system.name, 36.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().child(system.name.clone()))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(format!("{count} game{}", if count == 1 { "" } else { "s" }))),
+                    )
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.show(&MenuItem::Library(Some(id.clone())));
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let focused_name = match self.focus {
+            Focus::Home(0, c) => recent.get(c).map(|&i| self.games[i].name.as_str()),
+            _ => None,
+        };
+        let mut page = div()
+            .id("home")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(self.appearance.fill(0x0c1417))
+            .flex()
+            .flex_col()
+            .child(hero)
+            .child(div().h(px(1.)).bg(rgba((accent << 8) | 0x30)));
+        if !recent.is_empty() {
+            page = page.child(row_title("Continue Playing", focused_name)).child(continue_row);
+        }
+        page.child(row_title("Systems", None)).child(systems_row)
+    }
+
+    // ---- button hints -----------------------------------------------------
+
+    /// What the controller buttons do right now, shown in the bottom bar.
+    fn hints(&self) -> Vec<(Hint, &'static str)> {
+        if self.details.is_some() {
+            return vec![(Hint::Confirm, "Select"), (Hint::Back, "Close")];
+        }
+        match self.focus {
+            Focus::Menu(_) => vec![(Hint::Confirm, "Open"), (Hint::Bumpers, "Switch system")],
+            Focus::Grid | Focus::Home(0, _) => vec![(Hint::Confirm, "Play"), (Hint::Options, "Details"), (Hint::Back, "Back")],
+            Focus::Home(..) => vec![(Hint::Confirm, "Open"), (Hint::Back, "Back")],
+            Focus::Settings(_) => vec![(Hint::Confirm, "Select"), (Hint::Back, "Back")],
+        }
+    }
+
+    fn hint_bar(&self) -> Div {
+        let ps = gamepad::PLAYSTATION.load(std::sync::atomic::Ordering::Relaxed);
+        let mut bar = div().flex_1().flex().items_center().justify_center().gap_6();
+        for (hint, label) in self.hints() {
+            let badge = div().h(px(24.)).min_w(px(24.)).px_1().rounded_full().border_1().border_color(rgba(0xffffff50)).flex().items_center().justify_center().text_xs();
+            let badge = match (hint, ps) {
+                (Hint::Confirm, true) => badge.child(icon("btn-cross", 14., rgb(TEXT))),
+                (Hint::Back, true) => badge.child(icon("btn-circle", 14., rgb(TEXT))),
+                (Hint::Confirm, false) => badge.child("A"),
+                (Hint::Back, false) => badge.child("B"),
+                (Hint::Options, _) => badge.child(icon("btn-menu", 14., rgb(TEXT))),
+                (Hint::Bumpers, true) => badge.px_2().child("L1 R1"),
+                (Hint::Bumpers, false) => badge.px_2().child("LB RB"),
+            };
+            bar = bar.child(div().flex().items_center().gap_2().child(badge).child(label));
+        }
+        bar
+    }
+
+    fn bottom_bar(&self) -> Div {
         let focus = self.selected.map(|i| &self.games[i]);
         let left = match focus {
             Some(game) => div()
@@ -989,19 +1352,7 @@ impl Hub {
             .items_center()
             .gap_4()
             .child(left)
-            .child(
-                div().flex_1().flex().justify_center().child(
-                    Button::new("play")
-                        .primary()
-                        .label("Play")
-                        .disabled(focus.is_none())
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            if let Some(i) = view.selected {
-                                view.play(i, cx);
-                            }
-                        })),
-                ),
-            )
+            .child(self.hint_bar())
             .child(div().w(px(300.)).text_xs().text_right().text_color(rgb(MUTED)).child(if self.message.is_empty() {
                 format!("{} games", self.games.len())
             } else {
@@ -1018,6 +1369,7 @@ impl Render for Hub {
         self.columns = ((content + 20.) / 170.).floor().max(1.) as usize;
         let visible = self.visible(cx);
         let page = match self.view {
+            View::Home => self.home_page(cx),
             View::Library => self.library_page(&visible, cx),
             View::Settings => self.settings_page(cx),
         };
@@ -1067,7 +1419,7 @@ impl Render for Hub {
                 ),
             )
             .child(body)
-            .child(self.bottom_bar(cx))
+            .child(self.bottom_bar())
             .children(self.details.as_ref().map(|d| self.details_window(d, cx)))
     }
 }

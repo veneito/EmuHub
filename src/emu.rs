@@ -11,7 +11,12 @@ pub struct System {
     pub id: String,
     pub name: String,
     pub exts: Vec<String>,
+    /// RetroArch core; empty for systems that use a standalone emulator.
+    #[serde(default)]
     pub core: String,
+    /// Standalone emulator id (see EMULATORS); empty means RetroArch.
+    #[serde(default)]
+    pub standalone: String,
     /// Folder name on thumbnails.libretro.com.
     pub thumbs: String,
 }
@@ -25,6 +30,9 @@ pub struct Config {
     /// Optional SteamGridDB API key, used for covers libretro-thumbnails doesn't have.
     #[serde(default)]
     pub steamgriddb_key: String,
+    /// Standalone emulator programs picked in Settings, by emulator id.
+    #[serde(default)]
+    pub emulators: std::collections::HashMap<String, PathBuf>,
 }
 
 #[derive(Clone)]
@@ -58,13 +66,14 @@ fn default_config(home: &Path) -> Config {
     let steamgriddb_key = String::new();
     if cfg!(target_os = "windows") {
         let ra = PathBuf::from(r"C:\RetroArch-Win64");
-        Config { roms_dir, retroarch_cmd: vec![ra.join("retroarch.exe").display().to_string()], cores_dir: ra.join("cores"), steamgriddb_key }
+        Config { roms_dir, retroarch_cmd: vec![ra.join("retroarch.exe").display().to_string()], cores_dir: ra.join("cores"), steamgriddb_key, emulators: Default::default() }
     } else if cfg!(target_os = "macos") {
         Config {
             roms_dir,
             retroarch_cmd: vec!["/Applications/RetroArch.app/Contents/MacOS/RetroArch".into()],
             cores_dir: home.join("Library/Application Support/RetroArch/cores"),
             steamgriddb_key,
+            emulators: Default::default(),
         }
     } else {
         // SteamOS/EmuDeck installs RetroArch as a Flatpak.
@@ -73,6 +82,7 @@ fn default_config(home: &Path) -> Config {
             retroarch_cmd: vec!["flatpak".into(), "run".into(), "org.libretro.RetroArch".into()],
             cores_dir: home.join(".var/app/org.libretro.RetroArch/config/retroarch/cores"),
             steamgriddb_key,
+            emulators: Default::default(),
         }
     }
 }
@@ -99,6 +109,11 @@ pub fn create_folders(cfg: &Config) -> Result<(), String> {
 }
 
 /// Shows a folder in Explorer, Finder or the Linux file manager.
+/// Opens a web page in the default browser.
+pub fn open_url(url: &str) -> Result<(), String> {
+    open_folder(Path::new(url))
+}
+
 pub fn open_folder(dir: &Path) -> Result<(), String> {
     let opener = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     Command::new(opener).arg(dir).spawn().map(|_| ()).map_err(|e| format!("Could not open {}: {e}", dir.display()))
@@ -122,7 +137,10 @@ fn scan_dir(dir: &Path, system: &System, games: &mut Vec<Game>) {
     let has_playlist = paths.iter().any(|p| ext_of(p) == "m3u");
     for path in paths {
         if path.is_dir() {
-            scan_dir(&path, system, games);
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            if !["dlc", "updates", "update"].contains(&name.as_str()) {
+                scan_dir(&path, system, games);
+            }
             continue;
         }
         let ext = ext_of(&path);
@@ -140,6 +158,11 @@ fn core_file(core: &str) -> String {
 
 pub fn launch(cfg: &Config, game: &Game) -> Result<(), String> {
     let sys = systems().into_iter().find(|s| s.id == game.system).ok_or("unknown system")?;
+    if let Some(emu) = emulator(&sys.standalone) {
+        launch_standalone(cfg, emu, game)?;
+        record_play(game);
+        return Ok(());
+    }
     let core = cfg.cores_dir.join(core_file(&sys.core));
     if !core.exists() {
         return Err(format!("Core not found: {}. Use Settings → Install cores.", core.display()));
@@ -159,7 +182,153 @@ pub fn launch(cfg: &Config, game: &Game) -> Result<(), String> {
         .arg(&game.path)
         .spawn()
         .map_err(|e| format!("Could not start RetroArch: {e}"))?;
+    record_play(game);
     Ok(())
+}
+
+// ---- standalone emulators --------------------------------------------------
+
+/// An emulator that runs on its own instead of as a RetroArch core (systems.json "standalone").
+pub struct Emulator {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Official site, opened from Settings. EmuHub doesn't download these: some face takedowns,
+    /// and unofficial mirrors aren't safe to fetch automatically.
+    pub site: &'static str,
+    exe: &'static str,
+    /// Arguments before the game path.
+    args: &'static [&'static str],
+}
+
+pub const EMULATORS: [Emulator; 1] = [Emulator { id: "eden", name: "Eden", site: "https://eden-emu.dev", exe: "eden", args: &["-f", "-g"] }];
+
+pub fn emulator(id: &str) -> Option<&'static Emulator> {
+    EMULATORS.iter().find(|e| e.id == id)
+}
+
+/// The folder holding roms/, bios/, tools/ (EmuDeck's "Emulation" folder).
+fn emulation_dir(cfg: &Config) -> PathBuf {
+    cfg.roms_dir.parent().map(Path::to_path_buf).unwrap_or_default()
+}
+
+/// The emulator's program: the one picked in Settings, else the usual install places, else PATH.
+pub fn find_emulator(cfg: &Config, emu: &Emulator) -> Option<PathBuf> {
+    if let Some(picked) = cfg.emulators.get(emu.id).filter(|p| p.is_file()) {
+        return Some(picked.clone());
+    }
+    let exe = if cfg!(target_os = "windows") { format!("{}.exe", emu.exe) } else { emu.exe.to_owned() };
+    let mut places = vec![emulation_dir(cfg).join("tools").join(emu.id).join(&exe)];
+    if cfg!(target_os = "windows") {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            places.push(PathBuf::from(local).join("Programs").join(emu.id).join(&exe));
+        }
+    } else if cfg!(target_os = "macos") {
+        places.push(PathBuf::from(format!("/Applications/{}.app/Contents/MacOS/{}", emu.name, emu.exe)));
+    } else if let Ok(entries) = std::fs::read_dir(home().join("Applications")) {
+        // EmuDeck keeps AppImages like ~/Applications/Eden-x86_64.AppImage.
+        places.extend(entries.flatten().map(|e| e.path()).filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            name.starts_with(emu.exe) && name.ends_with(".appimage")
+        }));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        places.extend(std::env::split_paths(&path).map(|dir| dir.join(&exe)));
+    }
+    places.into_iter().find(|p| p.is_file())
+}
+
+/// Eden's data folder: "user" next to the program in portable mode, else the per-user folder.
+fn eden_user_dir(exe: &Path) -> PathBuf {
+    let portable = exe.parent().unwrap_or(Path::new("")).join("user");
+    if portable.is_dir() {
+        portable
+    } else if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(home).join("eden")
+    } else if cfg!(target_os = "macos") {
+        home().join("Library/Application Support/eden")
+    } else {
+        home().join(".local/share/eden")
+    }
+}
+
+/// Like EmuDeck: copies the user's own keys and firmware from Emulation/bios/eden into Eden if it has none yet.
+fn prepare_eden(cfg: &Config, exe: &Path) -> Result<(), String> {
+    let bios = emulation_dir(cfg).join("bios").join("eden");
+    let user = eden_user_dir(exe);
+    for keys in ["prod.keys", "title.keys"] {
+        let (from, to) = (bios.join(keys), user.join("keys").join(keys));
+        if from.is_file() && !to.exists() {
+            std::fs::create_dir_all(to.parent().unwrap()).map_err(|e| e.to_string())?;
+            std::fs::copy(&from, &to).map_err(|e| format!("Could not copy {keys}: {e}"))?;
+        }
+    }
+    let registered = user.join("nand/system/Contents/registered");
+    let has_firmware = std::fs::read_dir(&registered).is_ok_and(|mut d| d.next().is_some());
+    let mut zips: Vec<PathBuf> = std::fs::read_dir(&bios)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().unwrap_or_default().to_string_lossy().to_lowercase().starts_with("firmware") && p.extension().is_some_and(|e| e == "zip"))
+        .collect();
+    zips.sort(); // shortcut: picks the last by name, which is the newest for EmuDeck's "Firmware.X.Y.Z.zip" names
+    if let (false, Some(zip)) = (has_firmware, zips.last()) {
+        let file = std::fs::File::open(zip).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&registered).map_err(|e| e.to_string())?;
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            // Keep only the file name so nothing in the archive can write outside the firmware folder.
+            let Some(name) = Path::new(entry.name()).file_name().map(|n| n.to_owned()) else { continue };
+            if entry.is_dir() {
+                continue;
+            }
+            let mut out = std::fs::File::create(registered.join(name)).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn launch_standalone(cfg: &Config, emu: &Emulator, game: &Game) -> Result<(), String> {
+    let exe = find_emulator(cfg, emu).ok_or_else(|| format!("{} isn't installed. Get it in Settings → Emulators, then choose its program.", emu.name))?;
+    if emu.id == "eden" {
+        prepare_eden(cfg, &exe)?;
+    }
+    Command::new(&exe).args(emu.args).arg(&game.path).spawn().map_err(|e| format!("Could not start {}: {e}", emu.name))?;
+    Ok(())
+}
+
+// ---- play history ----------------------------------------------------------
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// When each game was last played (unix seconds), keyed by its file path.
+pub fn load_history() -> std::collections::HashMap<PathBuf, u64> {
+    std::fs::read(config_dir().join("history.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn record_play(game: &Game) {
+    let mut history = load_history();
+    history.insert(game.path.clone(), now());
+    // Best effort: a failed write only loses the "Continue Playing" order.
+    let _ = write_atomic(&config_dir().join("history.json"), &serde_json::to_vec(&history).unwrap());
+}
+
+/// "35 seconds ago", "5 days ago".
+pub fn ago(when: u64) -> String {
+    let secs = now().saturating_sub(when);
+    let (n, unit) = match secs {
+        0..60 => (secs, "second"),
+        60..3600 => (secs / 60, "minute"),
+        3600..86400 => (secs / 3600, "hour"),
+        86400..2_592_000 => (secs / 86400, "day"),
+        2_592_000..31_536_000 => (secs / 2_592_000, "month"),
+        _ => (secs / 31_536_000, "year"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
 /// RetroArch settings for this launch only: use EmuDeck's bios and save folders next to roms/ when they exist,
@@ -211,7 +380,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// Every core systems.json needs, without duplicates.
 fn needed_cores() -> Vec<String> {
-    let mut cores: Vec<String> = systems().into_iter().map(|s| s.core).collect();
+    let mut cores: Vec<String> = systems().into_iter().map(|s| s.core).filter(|c| !c.is_empty()).collect();
     cores.sort();
     cores.dedup();
     cores
@@ -337,7 +506,12 @@ pub fn cover_path(game: &Game) -> PathBuf {
 }
 
 fn libretro_url(sys: &System, name: &str) -> String {
-    format!("https://thumbnails.libretro.com/{}/Named_Boxarts/{}.png", url_encode(&sys.thumbs), url_encode(name))
+    libretro_media(sys, "Named_Boxarts", name)
+}
+
+/// A libretro-thumbnails image: "Named_Boxarts" (covers) or "Named_Snaps" (in-game screenshots).
+fn libretro_media(sys: &System, folder: &str, name: &str) -> String {
+    format!("https://thumbnails.libretro.com/{}/{folder}/{}.png", url_encode(&sys.thumbs), url_encode(name))
 }
 
 /// Every box-art name libretro has for a system, cached on disk because the listing is about 2 MB.
@@ -409,8 +583,8 @@ pub fn fetch_cover(game: &Game, steamgriddb_key: &str) -> bool {
         return false;
     }
     let Some(sys) = systems().into_iter().find(|s| s.id == game.system) else { return false };
-    let mut bytes = download(&libretro_url(&sys, &thumb_name(&game.name)), None).ok();
-    if bytes.is_none() {
+    let mut bytes = if sys.thumbs.is_empty() { None } else { download(&libretro_url(&sys, &thumb_name(&game.name)), None).ok() };
+    if bytes.is_none() && !sys.thumbs.is_empty() {
         if let Some(best) = libretro_matches(game, &libretro_names(&sys)).first() {
             bytes = download(&libretro_url(&sys, best), None).ok();
         }
@@ -480,6 +654,37 @@ pub fn set_cover(game: &Game, url: &str) -> Result<(), String> {
     write_atomic(&default_cover(game).with_extension("cover"), file.as_bytes())
 }
 
+/// Where a game's in-game screenshot (used for the Home hero image) is cached.
+pub fn snap_path(game: &Game) -> PathBuf {
+    cover_dir(game).join(format!("{}.snap.png", thumb_name(&game.name)))
+}
+
+/// Downloads a game's screenshot from libretro, by exact name then by closest name. Returns true if one exists.
+pub fn fetch_snap(game: &Game) -> bool {
+    let path = snap_path(game);
+    let miss = path.with_extension("nosnap");
+    if path.exists() {
+        return true;
+    }
+    if miss.exists() {
+        return false;
+    }
+    let Some(sys) = systems().into_iter().find(|s| s.id == game.system).filter(|s| !s.thumbs.is_empty()) else { return false };
+    let mut bytes = download(&libretro_media(&sys, "Named_Snaps", &thumb_name(&game.name)), None).ok();
+    if bytes.is_none() {
+        if let Some(best) = libretro_matches(game, &libretro_names(&sys)).first() {
+            bytes = download(&libretro_media(&sys, "Named_Snaps", best), None).ok();
+        }
+    }
+    match bytes {
+        Some(bytes) => write_atomic(&path, &bytes).is_ok(),
+        None => {
+            let _ = write_atomic(&miss, b"");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +732,53 @@ mod tests {
         assert_eq!(thumb_name("Q*bert: Arcade"), "Q_bert_ Arcade");
         assert_eq!(url_encode("A B(1)"), "A%20B%281%29");
         assert_eq!(percent_decode("Mario%20Kart%20DS%20(USA,%20Australia)"), "Mario Kart DS (USA, Australia)");
+    }
+
+    #[test]
+    fn eden_gets_keys_and_firmware_from_the_backup() {
+        let root = std::env::temp_dir().join("emuhub_eden_test");
+        let _ = std::fs::remove_dir_all(&root);
+        let bios = root.join("Emulation/bios/eden");
+        std::fs::create_dir_all(&bios).unwrap();
+        std::fs::write(bios.join("prod.keys"), b"keys").unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(bios.join("Firmware.21.1.0.zip")).unwrap());
+        // "../evil.nca" checks that archive paths can't escape the firmware folder.
+        for name in ["a.nca", "sub/b.nca", "../evil.nca"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, b"x").unwrap();
+        }
+        zip.finish().unwrap();
+        let exe = root.join("eden/eden.exe");
+        std::fs::create_dir_all(root.join("eden/user")).unwrap(); // portable mode
+        let cfg = Config { roms_dir: root.join("Emulation/roms"), ..default_config(&root) };
+        prepare_eden(&cfg, &exe).unwrap();
+        let user = root.join("eden/user");
+        assert_eq!(std::fs::read(user.join("keys/prod.keys")).unwrap(), b"keys");
+        let registered = user.join("nand/system/Contents/registered");
+        let mut files: Vec<String> = std::fs::read_dir(&registered).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
+        files.sort();
+        assert_eq!(files, ["a.nca", "b.nca", "evil.nca"]);
+        assert!(!root.join("eden/user/nand/system/Contents/evil.nca").exists());
+    }
+
+    #[test]
+    fn switch_dlc_and_updates_are_not_games() {
+        let dir = std::env::temp_dir().join("emuhub_switch_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("switch/dlc")).unwrap();
+        std::fs::create_dir_all(dir.join("switch/updates")).unwrap();
+        std::fs::write(dir.join("switch/Kirby.xci"), b"").unwrap();
+        std::fs::write(dir.join("switch/dlc/Kirby DLC.nsp"), b"").unwrap();
+        std::fs::write(dir.join("switch/updates/Kirby v1.nsp"), b"").unwrap();
+        let names: Vec<String> = scan(&dir, &systems()).into_iter().map(|g| g.name).collect();
+        assert_eq!(names, ["Kirby"]);
+    }
+
+    #[test]
+    fn ago_reads_naturally() {
+        assert_eq!(ago(now() - 35), "35 seconds ago");
+        assert_eq!(ago(now() - 3600), "1 hour ago");
+        assert_eq!(ago(now() - 5 * 86400), "5 days ago");
     }
 
     #[test]
