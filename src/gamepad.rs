@@ -15,6 +15,8 @@ pub enum Pad {
     NextTab,
     /// Start / Options / Menu button: opens a game's details.
     Options,
+    /// Select + Start (Share + Options) together: close the running game.
+    CloseGame,
 }
 
 pub type Queue = Arc<Mutex<Vec<Pad>>>;
@@ -34,10 +36,21 @@ pub fn spawn() -> Queue {
     std::thread::spawn(move || {
         let Ok(mut gilrs) = Gilrs::new() else { return };
         let mut stick = Stick::default();
+        let (mut start, mut select) = (false, false);
         loop {
             let Some(event) = gilrs.next_event_blocking(None) else { continue };
             if let Some(pad) = gilrs.connected_gamepad(event.id) {
                 PLAYSTATION.store(is_playstation(pad.name()), Ordering::Relaxed);
+            }
+            match event.event {
+                EventType::ButtonPressed(Button::Start, _) => start = true,
+                EventType::ButtonPressed(Button::Select, _) => select = true,
+                EventType::ButtonReleased(Button::Start, _) => start = false,
+                EventType::ButtonReleased(Button::Select, _) => select = false,
+                _ => {}
+            }
+            if start && select && matches!(event.event, EventType::ButtonPressed(Button::Start | Button::Select, _)) {
+                out.lock().unwrap().push(Pad::CloseGame);
             }
             if let Some(action) = map(event.event, &mut stick) {
                 out.lock().unwrap().push(action);

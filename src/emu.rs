@@ -134,6 +134,26 @@ pub fn emulator_dir(cfg: &Config, emu: &Emulator) -> PathBuf {
 }
 
 /// Shows a folder in Explorer, Finder or the Linux file manager.
+/// The .app bundle a macOS program lives in, e.g. /Applications/RetroArch.app for .../Contents/MacOS/RetroArch.
+fn app_bundle(exe: &Path) -> Option<&Path> {
+    exe.ancestors().find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")))
+}
+
+/// A command that starts a program. On macOS a program inside a .app is opened through `open`, like the
+/// Finder does, so it comes to the front; started directly it opens behind EmuHub. Add arguments as usual.
+fn start(exe: &Path) -> Command {
+    match app_bundle(exe).filter(|_| cfg!(target_os = "macos")) {
+        Some(bundle) => {
+            // -n: a fresh copy, so the game arguments are used even if the app is already open.
+            // -W: `open` waits until the app quits, so EmuHub can tell a game is still running.
+            let mut command = Command::new("open");
+            command.arg("-n").arg("-W").arg("-a").arg(bundle).arg("--args");
+            command
+        }
+        None => Command::new(exe),
+    }
+}
+
 /// Opens a web page in the default browser.
 pub fn open_url(url: &str) -> Result<(), String> {
     open_folder(Path::new(url))
@@ -185,34 +205,57 @@ fn core_file(core: &str) -> String {
     format!("{core}_libretro.{suffix}")
 }
 
-pub fn launch(cfg: &Config, game: &Game) -> Result<(), String> {
+/// A running emulator, so EmuHub can tell when it's still open and close it on Share+Options.
+pub struct Running {
+    child: std::process::Child,
+    /// Standalone emulators are closed by EmuHub; RetroArch handles the combo itself (and saves first).
+    close_on_combo: bool,
+}
+
+impl Running {
+    pub fn is_open(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Asks the emulator to close, like clicking its window's X (not a force-quit, so it can save).
+    pub fn close(&self) {
+        if !self.close_on_combo {
+            return;
+        }
+        let pid = self.child.id().to_string();
+        let _ = if cfg!(target_os = "windows") {
+            Command::new("taskkill").args(["/PID", &pid]).output()
+        } else {
+            Command::new("kill").args(["-TERM", &pid]).output()
+        };
+    }
+}
+
+/// Starts a game in RetroArch or its standalone emulator.
+pub fn launch(cfg: &Config, game: &Game) -> Result<Running, String> {
     let sys = systems().into_iter().find(|s| s.id == game.system).ok_or("unknown system")?;
     if let Some(emu) = emulator(&sys.standalone) {
-        launch_standalone(cfg, emu, game)?;
+        let running = launch_standalone(cfg, emu, game)?;
         record_play(game);
-        return Ok(());
+        return Ok(running);
     }
     let core = cfg.cores_dir.join(core_file(&sys.core));
     if !core.exists() {
         return Err(format!("Core not found: {}. Use Settings → Install cores.", core.display()));
     }
-    let (exe, args) = cfg.retroarch_cmd.split_first().ok_or("RetroArch command is empty")?;
-    let mut command = Command::new(exe);
-    command.args(args);
-    let overrides = retroarch_overrides(&cfg.roms_dir);
-    if !overrides.is_empty() {
-        let file = config_dir().join("retroarch-overrides.cfg");
-        write_atomic(&file, overrides.as_bytes())?;
-        command.arg("--appendconfig").arg(file);
-    }
-    command
-        .arg("-L")
-        .arg(core)
-        .arg(&game.path)
-        .spawn()
-        .map_err(|e| format!("Could not start RetroArch: {e}"))?;
+    let child = retroarch(cfg)?.arg("-L").arg(core).arg(&game.path).spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
     record_play(game);
-    Ok(())
+    Ok(Running { child, close_on_combo: false })
+}
+
+/// RetroArch, fullscreen, with EmuHub's settings for this run (see retroarch_overrides).
+fn retroarch(cfg: &Config) -> Result<Command, String> {
+    let (exe, args) = cfg.retroarch_cmd.split_first().ok_or("RetroArch command is empty")?;
+    let file = config_dir().join("retroarch-overrides.cfg");
+    write_atomic(&file, retroarch_overrides(&cfg.roms_dir).as_bytes())?;
+    let mut command = start(Path::new(exe));
+    command.args(args).arg("--fullscreen").arg("--appendconfig").arg(file);
+    Ok(command)
 }
 
 // ---- standalone emulators --------------------------------------------------
@@ -319,13 +362,16 @@ fn prepare_eden(cfg: &Config, exe: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn launch_standalone(cfg: &Config, emu: &Emulator, game: &Game) -> Result<(), String> {
+fn launch_standalone(cfg: &Config, emu: &Emulator, game: &Game) -> Result<Running, String> {
     let exe = find_emulator(cfg, emu).ok_or_else(|| format!("{} isn't installed. Get it in Settings → Emulators, then choose its program.", emu.name))?;
     if emu.id == "eden" {
         prepare_eden(cfg, &exe)?;
     }
-    Command::new(&exe).args(emu.args).arg(&game.path).spawn().map_err(|e| format!("Could not start {}: {e}", emu.name))?;
-    Ok(())
+    let child = start(&exe).args(emu.args).arg(&game.path).spawn().map_err(|e| format!("Could not start {}: {e}", emu.name))?;
+    // On macOS the child is `open -W` (it waits for the app), so closing it wouldn't close the emulator.
+    // shortcut: the combo doesn't close macOS standalone emulators; quit the app by bundle id if needed.
+    let mac_app = cfg!(target_os = "macos") && app_bundle(&exe).is_some();
+    Ok(Running { child, close_on_combo: !mac_app })
 }
 
 // ---- play history ----------------------------------------------------------
@@ -363,8 +409,15 @@ pub fn ago(when: u64) -> String {
 /// RetroArch settings for this launch only: use EmuDeck's bios and save folders next to roms/ when they exist,
 /// so BIOS files and saves copied from a Steam Deck work without moving anything.
 fn retroarch_overrides(roms_dir: &Path) -> String {
-    let Some(emulation) = roms_dir.parent() else { return String::new() };
-    let mut text = String::new();
+    // Share+Options (Select+Start) quits right away; RetroArch then writes saves before closing.
+    // 4 is RetroArch's "Start + Select" combo.
+    let mut text = String::from("input_quit_gamepad_combo = \"4\"\nquit_press_twice = \"false\"\n");
+    // Intel Macs run RetroArch's native Metal driver better than Vulkan (which goes through MoltenVK there).
+    if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        text += "video_driver = \"metal\"
+";
+    }
+    let Some(emulation) = roms_dir.parent() else { return text };
     for (key, rel) in [
         ("system_directory", "bios"),
         ("savefile_directory", "saves/retroarch/saves"),
@@ -436,9 +489,9 @@ pub fn retroarch_installed(cfg: &Config) -> bool {
 }
 
 /// Starts RetroArch on its own, e.g. to change its settings.
-pub fn open_retroarch(cfg: &Config) -> Result<(), String> {
-    let (exe, args) = cfg.retroarch_cmd.split_first().ok_or("RetroArch command is empty")?;
-    Command::new(exe).args(args).spawn().map(|_| ()).map_err(|e| format!("Could not start RetroArch: {e}"))
+pub fn open_retroarch(cfg: &Config) -> Result<Running, String> {
+    let child = retroarch(cfg)?.spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
+    Ok(Running { child, close_on_combo: false })
 }
 
 /// Downloads every core systems.json needs that isn't already in cores_dir. Returns how many were installed.
@@ -467,7 +520,15 @@ pub fn install_retroarch() -> Result<(), String> {
     let (exe, args): (&str, &[&str]) = if cfg!(target_os = "windows") {
         ("winget", &["install", "--exact", "--id", "Libretro.RetroArch", "--silent", "--accept-package-agreements", "--accept-source-agreements"])
     } else if cfg!(target_os = "macos") {
-        ("brew", &["install", "--cask", "retroarch"])
+        // Homebrew's own folders (Intel, Apple Silicon) often aren't on the PATH an app starts with.
+        // Homebrew no longer supports Intel Macs, so only suggest it on Apple Silicon.
+        let missing = if cfg!(target_arch = "aarch64") {
+            "Homebrew isn't installed. Get RetroArch from retroarch.com (drag it into Applications), or install Homebrew from brew.sh."
+        } else {
+            "Get RetroArch from retroarch.com and drag it into Applications (Homebrew no longer supports Intel Macs)."
+        };
+        let brew = ["/usr/local/bin/brew", "/opt/homebrew/bin/brew"].into_iter().find(|p| Path::new(p).is_file()).ok_or(missing)?;
+        (brew, &["install", "--cask", "retroarch"])
     } else {
         ("flatpak", &["install", "--user", "-y", "flathub", "org.libretro.RetroArch"])
     };
@@ -753,6 +814,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("bios")).unwrap();
         let text = retroarch_overrides(&dir.join("roms"));
         assert!(text.contains("system_directory") && !text.contains("savefile_directory"));
+        assert!(text.contains("input_quit_gamepad_combo = \"4\""));
     }
 
     #[test]
@@ -826,6 +888,13 @@ mod tests {
         std::fs::write(dir.join("switch/updates/Kirby v1.nsp"), b"").unwrap();
         let names: Vec<String> = scan(&dir, &systems()).into_iter().map(|g| g.name).collect();
         assert_eq!(names, ["Kirby"]);
+    }
+
+    #[test]
+    fn mac_programs_are_found_inside_their_app_bundle() {
+        let exe = Path::new("/Applications/RetroArch.app/Contents/MacOS/RetroArch");
+        assert_eq!(app_bundle(exe), Some(Path::new("/Applications/RetroArch.app")));
+        assert_eq!(app_bundle(Path::new("/usr/bin/retroarch")), None);
     }
 
     #[test]

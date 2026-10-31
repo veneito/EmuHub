@@ -121,6 +121,8 @@ struct Hub {
     details: Option<Details>,
     /// Focus rings only show once a controller has been used, so mouse users don't see them.
     pad_used: bool,
+    /// The emulator EmuHub started, while it's open: only one game at a time, and Share+Options closes it.
+    running: Option<emu::Running>,
     /// Controller input is ignored while another window (e.g. a running game) has focus.
     active: bool,
     /// Cards per grid row, measured each frame for up/down navigation.
@@ -278,6 +280,7 @@ impl Hub {
             details: None,
             pad_used: false,
             active: true,
+            running: None,
             columns: 1,
             grid_scroll: UniformListScrollHandle::new(),
             visible_cache: vec![],
@@ -373,10 +376,28 @@ impl Hub {
         .detach();
     }
 
+    /// True (and says so) while a game or RetroArch that EmuHub started is still open.
+    fn game_running(&mut self) -> bool {
+        let open = self.running.as_mut().is_some_and(|r| r.is_open());
+        if open {
+            self.message = "A game is already running. Close it first (Share + Options).".into();
+        } else {
+            self.running = None;
+        }
+        open
+    }
+
     fn play(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.game_running() {
+            cx.notify();
+            return;
+        }
         let game = &self.games[index];
         self.message = match emu::launch(&self.config, game) {
-            Ok(()) => format!("Launched {}", game.name),
+            Ok(running) => {
+                self.running = Some(running);
+                format!("Launched {}", game.name)
+            }
             Err(error) => error,
         };
         self.history = emu::load_history();
@@ -428,6 +449,15 @@ impl Hub {
     }
 
     fn on_pad(&mut self, action: Pad, window: &mut Window, cx: &mut Context<Self>) {
+        // While a game is in front, the only thing EmuHub listens for is the close combo.
+        if action == Pad::CloseGame {
+            if !gamepad::app_in_front() {
+                if let Some(running) = &self.running {
+                    running.close();
+                }
+            }
+            return;
+        }
         if !self.active || !gamepad::app_in_front() {
             return;
         }
@@ -439,6 +469,7 @@ impl Hub {
         }
         let menu = self.menu();
         match (self.focus, action) {
+            (_, Pad::CloseGame) => {} // handled above
             (_, Pad::PrevTab | Pad::NextTab) => {
                 let tabs = menu.len() - 1; // Settings isn't a tab
                 let at = self.current_menu().min(tabs - 1);
@@ -515,7 +546,7 @@ impl Hub {
                 return;
             }
             Pad::Confirm => return self.details_action(focus, cx),
-            Pad::PrevTab | Pad::NextTab => return,
+            Pad::PrevTab | Pad::NextTab | Pad::CloseGame => return,
             Pad::Left => focus.saturating_sub(1),
             Pad::Right => (focus + 1).min(count - 1),
             Pad::Up if focus < DETAIL_BUTTONS => focus,
@@ -730,7 +761,12 @@ impl Hub {
                 self.rescan(cx);
             }
             Setting::RetroArch if emu::retroarch_installed(&self.config) => {
-                self.message = emu::open_retroarch(&self.config).err().unwrap_or_default();
+                if !self.game_running() {
+                    match emu::open_retroarch(&self.config) {
+                        Ok(running) => self.running = Some(running),
+                        Err(error) => self.message = error,
+                    }
+                }
             }
             Setting::RetroArch => {
                 self.run("Installing RetroArch…", |_| emu::install_retroarch().map(|()| "RetroArch installed.".into()), cx)
@@ -1505,6 +1541,15 @@ impl Hub {
 
 impl Render for Hub {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let on_page = match self.focus {
+            Focus::Menu(i) => i < self.menu().len(),
+            Focus::Grid => self.view == View::Library,
+            Focus::Settings(_) => self.view == View::Settings,
+            Focus::Home(..) => self.view == View::Home,
+        };
+        if !on_page {
+            self.focus = Focus::Menu(self.current_menu());
+        }
         // Sidebar, window padding, border and grid padding; each card is 150px plus a 20px gap.
         let chrome = if self.sidebar_open { 256. } else { 0. } + 16. + 4. + 2. + 48.;
         let content = window.viewport_size().width / px(1.) - chrome;
