@@ -209,13 +209,44 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
-/// Downloads every core systems.json needs that isn't already in cores_dir. Returns how many were installed.
-pub fn install_cores(cfg: &Config) -> Result<usize, String> {
+/// Every core systems.json needs, without duplicates.
+fn needed_cores() -> Vec<String> {
     let mut cores: Vec<String> = systems().into_iter().map(|s| s.core).collect();
     cores.sort();
     cores.dedup();
+    cores
+}
+
+/// Returns (missing, total) core counts for the Settings page.
+pub fn core_status(cfg: &Config) -> (usize, usize) {
+    let cores = needed_cores();
+    let missing = cores.iter().filter(|c| !cfg.cores_dir.join(core_file(c)).exists()).count();
+    (missing, cores.len())
+}
+
+/// Whether the configured RetroArch command points at something installed.
+pub fn retroarch_installed(cfg: &Config) -> bool {
+    match cfg.retroarch_cmd.first().map(String::as_str) {
+        Some("flatpak") => [home().join(".local/share/flatpak/app/org.libretro.RetroArch"), PathBuf::from("/var/lib/flatpak/app/org.libretro.RetroArch")]
+            .iter()
+            .any(|p| p.is_dir()),
+        Some(exe) if Path::new(exe).is_absolute() => Path::new(exe).exists(),
+        // shortcut: a bare command like "retroarch" is assumed to be on PATH; check PATH if that misleads people.
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Starts RetroArch on its own, e.g. to change its settings.
+pub fn open_retroarch(cfg: &Config) -> Result<(), String> {
+    let (exe, args) = cfg.retroarch_cmd.split_first().ok_or("RetroArch command is empty")?;
+    Command::new(exe).args(args).spawn().map(|_| ()).map_err(|e| format!("Could not start RetroArch: {e}"))
+}
+
+/// Downloads every core systems.json needs that isn't already in cores_dir. Returns how many were installed.
+pub fn install_cores(cfg: &Config) -> Result<usize, String> {
     let mut installed = 0;
-    for core in cores {
+    for core in needed_cores() {
         let file = core_file(&core);
         if cfg.cores_dir.join(&file).exists() {
             continue;

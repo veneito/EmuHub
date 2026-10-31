@@ -33,6 +33,25 @@ pub fn spawn() -> Queue {
     queue
 }
 
+/// Whether one of our windows is in front. GPUI's activation event alone missed RetroArch taking focus
+/// on Windows, so there we ask the OS which process owns the foreground window.
+#[cfg(target_os = "windows")]
+pub fn app_in_front() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetForegroundWindow() -> isize;
+        fn GetWindowThreadProcessId(window: isize, pid: *mut u32) -> u32;
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut pid) };
+    pid == std::process::id()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn app_in_front() -> bool {
+    true // shortcut: relies on GPUI's activation event only; add an OS check if games still leak input on macOS/Linux.
+}
+
 /// Last left-stick position, so a push past the threshold fires once instead of every frame.
 #[derive(Default)]
 struct Stick {

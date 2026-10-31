@@ -233,7 +233,7 @@ impl Hub {
     }
 
     fn on_pad(&mut self, action: Pad, cx: &mut Context<Self>) {
-        if !self.active {
+        if !self.active || !gamepad::app_in_front() {
             return;
         }
         match action {
@@ -521,16 +521,36 @@ impl Hub {
                     })),
                 )
             })
-            .child(setting_row("RetroArch", "Installs with winget, Homebrew or Flatpak.").child(
-                Button::new("install-retroarch").label("Install").disabled(self.busy).on_click(cx.listener(|view, _, _, cx| {
-                    view.run("Installing RetroArch…", |_| emu::install_retroarch().map(|()| "RetroArch installed.".into()), cx)
-                })),
-            ))
-            .child(setting_row("Cores", "Downloads the cores your systems need from libretro.").child(
-                Button::new("install-cores").label("Install").disabled(self.busy).on_click(cx.listener(|view, _, _, cx| {
-                    view.run("Downloading cores…", |config| emu::install_cores(&config).map(|n| format!("Installed {n} new cores.")), cx)
-                })),
-            ));
+            .child(if emu::retroarch_installed(&self.config) {
+                setting_row("RetroArch", "Installed. Open it to change its own settings.").child(
+                    Button::new("open-retroarch").label("Open").on_click(cx.listener(|view, _, _, cx| {
+                        view.message = emu::open_retroarch(&view.config).err().unwrap_or_default();
+                        cx.notify();
+                    })),
+                )
+            } else {
+                setting_row("RetroArch", "Not installed. Installs with winget, Homebrew or Flatpak.").child(
+                    Button::new("install-retroarch").label("Install").disabled(self.busy).on_click(cx.listener(|view, _, _, cx| {
+                        view.run("Installing RetroArch…", |_| emu::install_retroarch().map(|()| "RetroArch installed.".into()), cx)
+                    })),
+                )
+            })
+            .child({
+                let (missing, total) = emu::core_status(&self.config);
+                let note = if missing == 0 {
+                    format!("All {total} cores installed.")
+                } else {
+                    format!("{missing} of {total} cores missing. Downloads them from libretro.")
+                };
+                setting_row("Cores", &note).child(
+                    Button::new("install-cores")
+                        .label(if missing == 0 { "Installed" } else { "Install" })
+                        .disabled(self.busy || missing == 0)
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.run("Downloading cores…", |config| emu::install_cores(&config).map(|n| format!("Installed {n} new cores.")), cx)
+                        })),
+                )
+            });
 
         let mut modes = div().flex().gap_2();
         for (label, glass) in [("Solid", false), ("Glass", true)] {
