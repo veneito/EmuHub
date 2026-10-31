@@ -23,6 +23,52 @@ enum View {
     Settings,
 }
 
+/// Where the controller is, RetroArch style: the side menu, the game grid, or a Settings button.
+#[derive(Clone, Copy, PartialEq)]
+enum Focus {
+    Menu(usize),
+    Grid,
+    Settings(usize),
+}
+
+/// One side-menu entry: a library filter (None = all games) or Settings.
+#[derive(Clone, PartialEq)]
+enum MenuItem {
+    Library(Option<String>),
+    Settings,
+}
+
+/// The Settings buttons a controller can reach, top to bottom.
+#[derive(Clone, Copy, PartialEq)]
+enum Setting {
+    RomFolders,
+    RetroArch,
+    Cores,
+    Glass(bool),
+    Palette(usize),
+}
+
+const PALETTES: [(&str, u32, u32); 5] = [
+    ("Teal", 0x0c1417, 0x92c8e5),
+    ("Graphite", 0x151515, 0xc4c4ce),
+    ("Blue", 0x101a2d, 0x92b9ff),
+    ("Plum", 0x211324, 0xd5a8e3),
+    ("Forest", 0x101f19, 0x91cba6),
+];
+
+const SETTINGS: [Setting; 10] = [
+    Setting::RomFolders,
+    Setting::RetroArch,
+    Setting::Cores,
+    Setting::Glass(false),
+    Setting::Glass(true),
+    Setting::Palette(0),
+    Setting::Palette(1),
+    Setting::Palette(2),
+    Setting::Palette(3),
+    Setting::Palette(4),
+];
+
 struct Hub {
     query: Entity<InputState>,
     roms_dir: Entity<InputState>,
@@ -37,6 +83,9 @@ struct Hub {
     selected: Option<usize>,
     sidebar_open: bool,
     busy: bool,
+    focus: Focus,
+    /// Focus rings only show once a controller has been used, so mouse users don't see them.
+    pad_used: bool,
     /// Controller input is ignored while another window (e.g. a running game) has focus.
     active: bool,
     /// Cards per grid row, measured each frame for up/down navigation.
@@ -148,11 +197,13 @@ impl Hub {
         .detach();
         cx.observe_window_activation(window, |view, window, _| view.active = window.is_window_active()).detach();
         let pad = gamepad::spawn();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
                 let actions = std::mem::take(&mut *pad.lock().unwrap());
-                if !actions.is_empty() && this.update(cx, |view, cx| actions.into_iter().for_each(|a| view.on_pad(a, cx))).is_err() {
+                if !actions.is_empty()
+                    && this.update_in(cx, |view, window, cx| actions.into_iter().for_each(|a| view.on_pad(a, window, cx))).is_err()
+                {
                     return;
                 }
             }
@@ -173,6 +224,8 @@ impl Hub {
             selected: None,
             sidebar_open: true,
             busy: false,
+            focus: Focus::Menu(0),
+            pad_used: false,
             active: true,
             columns: 1,
             grid_scroll: ScrollHandle::new(),
@@ -232,36 +285,149 @@ impl Hub {
         cx.notify();
     }
 
-    fn on_pad(&mut self, action: Pad, cx: &mut Context<Self>) {
+    /// Side-menu entries in order: All games, each system that has games, Settings.
+    fn menu(&self) -> Vec<MenuItem> {
+        let mut items = vec![MenuItem::Library(None)];
+        items.extend(
+            self.systems
+                .iter()
+                .filter(|s| self.games.iter().any(|g| g.system == s.id))
+                .map(|s| MenuItem::Library(Some(s.id.clone()))),
+        );
+        items.push(MenuItem::Settings);
+        items
+    }
+
+    /// The menu entry for the page on screen.
+    fn current_menu(&self) -> usize {
+        let here = match self.view {
+            View::Settings => MenuItem::Settings,
+            View::Library => MenuItem::Library(self.system.clone()),
+        };
+        self.menu().iter().position(|m| *m == here).unwrap_or(0)
+    }
+
+    fn show(&mut self, item: &MenuItem) {
+        match item {
+            MenuItem::Settings => self.view = View::Settings,
+            MenuItem::Library(system) => {
+                if self.view != View::Library || self.system != *system {
+                    self.selected = None;
+                }
+                self.view = View::Library;
+                self.system = system.clone();
+            }
+        }
+    }
+
+    fn on_pad(&mut self, action: Pad, window: &mut Window, cx: &mut Context<Self>) {
         if !self.active || !gamepad::app_in_front() {
             return;
         }
-        match action {
-            Pad::PrevTab | Pad::NextTab => {
-                let mut tabs: Vec<Option<String>> = vec![None];
-                tabs.extend(self.systems.iter().filter(|s| self.games.iter().any(|g| g.system == s.id)).map(|s| Some(s.id.clone())));
-                let at = tabs.iter().position(|t| *t == self.system).unwrap_or(0);
-                let next = if action == Pad::NextTab { (at + 1) % tabs.len() } else { (at + tabs.len() - 1) % tabs.len() };
-                self.system = tabs[next].clone();
-                self.view = View::Library;
-                self.selected = None;
+        self.pad_used = true;
+        let menu = self.menu();
+        match (self.focus, action) {
+            (_, Pad::PrevTab | Pad::NextTab) => {
+                let tabs = menu.len() - 1; // Settings isn't a tab
+                let at = self.current_menu().min(tabs - 1);
+                let next = if action == Pad::NextTab { (at + 1) % tabs } else { (at + tabs - 1) % tabs };
+                self.show(&menu[next]);
+                self.focus = Focus::Menu(next);
             }
-            Pad::Back if self.view == View::Settings => self.view = View::Library,
-            Pad::Back => {
-                self.system = None;
-                self.selected = None;
+            // Side menu: up/down previews each page, X or Right goes into it.
+            (Focus::Menu(i), Pad::Up | Pad::Down) => {
+                let i = if action == Pad::Up { i.saturating_sub(1) } else { (i + 1).min(menu.len() - 1) };
+                self.show(&menu[i]);
+                self.focus = Focus::Menu(i);
             }
-            _ if self.view != View::Library => return,
-            Pad::Confirm => match self.selected {
+            (Focus::Menu(i), Pad::Confirm | Pad::Right) => {
+                self.show(&menu[i]);
+                if menu[i] == MenuItem::Settings {
+                    self.focus = Focus::Settings(0);
+                } else if !self.visible(cx).is_empty() {
+                    self.focus = Focus::Grid;
+                    self.move_selection(0, cx);
+                }
+            }
+            (Focus::Menu(_), _) => {}
+            // Game grid: Left from the first column, or O, returns to the menu.
+            (Focus::Grid, Pad::Back) => self.focus = Focus::Menu(self.current_menu()),
+            (Focus::Grid, Pad::Left) if self.grid_position(cx).is_none_or(|p| p % self.columns == 0) => {
+                self.focus = Focus::Menu(self.current_menu())
+            }
+            (Focus::Grid, Pad::Confirm) => match self.selected {
                 Some(i) => self.play(i, cx),
                 None => self.move_selection(0, cx),
             },
-            Pad::Left => self.move_selection(-1, cx),
-            Pad::Right => self.move_selection(1, cx),
-            Pad::Up => self.move_selection(-(self.columns as isize), cx),
-            Pad::Down => self.move_selection(self.columns as isize, cx),
+            (Focus::Grid, Pad::Left) => self.move_selection(-1, cx),
+            (Focus::Grid, Pad::Right) => self.move_selection(1, cx),
+            (Focus::Grid, Pad::Up) => self.move_selection(-(self.columns as isize), cx),
+            (Focus::Grid, Pad::Down) => self.move_selection(self.columns as isize, cx),
+            // Settings: up/down through the buttons, X presses, O or Left returns to the menu.
+            (Focus::Settings(_), Pad::Back | Pad::Left) => self.focus = Focus::Menu(self.current_menu()),
+            (Focus::Settings(j), Pad::Up) => self.focus = Focus::Settings(j.saturating_sub(1)),
+            (Focus::Settings(j), Pad::Down) => self.focus = Focus::Settings((j + 1).min(SETTINGS.len() - 1)),
+            (Focus::Settings(j), Pad::Confirm) => self.apply_setting(SETTINGS[j], window, cx),
+            (Focus::Settings(_), Pad::Right) => {}
         }
         cx.notify();
+    }
+
+    /// Position of the selected game within the visible list.
+    fn grid_position(&self, cx: &App) -> Option<usize> {
+        let selected = self.selected?;
+        self.visible(cx).iter().position(|&v| v == selected)
+    }
+
+    /// What each Settings button does, for both mouse clicks and the controller.
+    fn apply_setting(&mut self, setting: Setting, window: &mut Window, cx: &mut Context<Self>) {
+        match setting {
+            Setting::RomFolders if self.config.roms_dir.is_dir() => {
+                self.message = emu::open_folder(&self.config.roms_dir).err().unwrap_or_default();
+            }
+            Setting::RomFolders => {
+                self.message = match emu::create_folders(&self.config) {
+                    Ok(()) => format!("Created folders in {}", self.config.roms_dir.display()),
+                    Err(error) => error,
+                };
+                self.rescan(cx);
+            }
+            Setting::RetroArch if emu::retroarch_installed(&self.config) => {
+                self.message = emu::open_retroarch(&self.config).err().unwrap_or_default();
+            }
+            Setting::RetroArch => {
+                self.run("Installing RetroArch…", |_| emu::install_retroarch().map(|()| "RetroArch installed.".into()), cx)
+            }
+            Setting::Cores => {
+                if emu::core_status(&self.config).0 > 0 {
+                    self.run("Downloading cores…", |config| emu::install_cores(&config).map(|n| format!("Installed {n} new cores.")), cx)
+                }
+            }
+            Setting::Glass(glass) => {
+                self.appearance.glass = glass;
+                self.save_appearance(window, cx);
+            }
+            Setting::Palette(i) => {
+                let (_, surface, accent) = PALETTES[i];
+                self.appearance.surface = surface;
+                self.appearance.accent = accent;
+                self.save_appearance(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Accent outline around whatever the controller is on.
+    fn ring<E: Styled>(&self, element: E, on: bool) -> E {
+        let color: Hsla = if on && self.pad_used { rgb(self.appearance.accent).into() } else { rgba(0x00000000).into() };
+        element.border_2().border_color(color)
+    }
+
+    /// A Settings button wrapped in its focus ring.
+    fn setting_button(&self, setting: Setting, button: Button, cx: &mut Context<Self>) -> Div {
+        let focused = self.focus == Focus::Settings(SETTINGS.iter().position(|s| *s == setting).unwrap());
+        self.ring(div().rounded_md(), focused)
+            .child(button.on_click(cx.listener(move |view, _, window, cx| view.apply_setting(setting, window, cx))))
     }
 
     /// Moves the selection through the visible games, starting at the first one if nothing is selected.
@@ -334,12 +500,14 @@ impl Hub {
         let tone = |selected: bool| rgb(if selected { 0xf5f3ee } else { MUTED });
         let all = self.view == View::Library && self.system.is_none();
         let settings = self.view == View::Settings;
+        let menu_len = self.menu().len();
+        let focused = |i: usize| self.focus == Focus::Menu(i);
         let mut nav = div()
             .flex()
             .flex_col()
             .gap_1()
             .child(
-                self.nav_row("nav-all", all)
+                self.ring(self.nav_row("nav-all", all), focused(0))
                     .child(icon("library", 18., tone(all)))
                     .child(div().flex_1().child("All games"))
                     .child(div().text_xs().text_color(rgb(MUTED)).child(self.games.len().to_string()))
@@ -350,15 +518,17 @@ impl Hub {
                     })),
             )
             .child(div().px_3().pt_3().pb_1().child(heading("Your Library")));
+        let mut row = 0;
         for system in &self.systems {
             let count = self.games.iter().filter(|g| g.system == system.id).count();
             if count == 0 {
                 continue;
             }
+            row += 1;
             let selected = self.view == View::Library && self.system.as_deref() == Some(system.id.as_str());
             let pick = system.id.clone();
             nav = nav.child(
-                self.nav_row(SharedString::from(format!("sys-{}", system.id)), selected)
+                self.ring(self.nav_row(SharedString::from(format!("sys-{}", system.id)), selected), focused(row))
                     .child(tile(&system.name, 24.))
                     .child(div().flex_1().truncate().child(system.name.clone()))
                     .child(div().text_xs().text_color(rgb(MUTED)).child(count.to_string()))
@@ -382,7 +552,7 @@ impl Hub {
             .justify_between()
             .child(nav)
             .child(
-                self.nav_row("nav-settings", settings)
+                self.ring(self.nav_row("nav-settings", settings), focused(menu_len - 1))
                     .child(icon("settings", 18., tone(settings)))
                     .child("Settings")
                     .on_click(cx.listener(|view, _, _, cx| {
@@ -432,6 +602,7 @@ impl Hub {
                     .cursor_pointer()
                     .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
                         view.selected = Some(index);
+                        view.focus = Focus::Grid;
                         if event.click_count() >= 2 {
                             view.play(index, cx);
                         }
@@ -444,7 +615,12 @@ impl Hub {
                             .rounded_lg()
                             .overflow_hidden()
                             .border_2()
-                            .border_color(if selected { rgb(accent).into() } else { rgba(0xffffff14) })
+                            // Bright when the controller is in the grid, dim while it's in the side menu.
+                            .border_color(match (selected, self.focus == Focus::Grid) {
+                                (true, true) => rgb(accent).into(),
+                                (true, false) => rgba((accent << 8) | 0x60),
+                                _ => rgba(0xffffff14),
+                            })
                             .child(art),
                     )
                     .child(div().text_size(px(14.)).line_clamp(2).child(game.name.clone()))
@@ -502,86 +678,65 @@ impl Hub {
                 Button::new("save").primary().label("Save").on_click(cx.listener(|view, _, _, cx| view.save_settings(cx))),
             ));
 
+        let folders_exist = self.config.roms_dir.is_dir();
+        let retroarch = emu::retroarch_installed(&self.config);
+        let (missing, total) = emu::core_status(&self.config);
         let setup = card()
-            .child(if self.config.roms_dir.is_dir() {
-                setting_row("ROM folders", "Put each game in its system's folder, then Rescan.").child(
-                    Button::new("open-folders").label("Open").on_click(cx.listener(|view, _, _, cx| {
-                        view.message = emu::open_folder(&view.config.roms_dir).err().unwrap_or_default();
-                        cx.notify();
-                    })),
-                )
-            } else {
-                setting_row("ROM folders", "Creates a folder for every supported system.").child(
-                    Button::new("create-folders").label("Create").on_click(cx.listener(|view, _, _, cx| {
-                        view.message = match emu::create_folders(&view.config) {
-                            Ok(()) => format!("Created folders in {}", view.config.roms_dir.display()),
-                            Err(error) => error,
-                        };
-                        view.rescan(cx);
-                    })),
-                )
-            })
-            .child(if emu::retroarch_installed(&self.config) {
-                setting_row("RetroArch", "Installed. Open it to change its own settings.").child(
-                    Button::new("open-retroarch").label("Open").on_click(cx.listener(|view, _, _, cx| {
-                        view.message = emu::open_retroarch(&view.config).err().unwrap_or_default();
-                        cx.notify();
-                    })),
-                )
-            } else {
-                setting_row("RetroArch", "Not installed. Installs with winget, Homebrew or Flatpak.").child(
-                    Button::new("install-retroarch").label("Install").disabled(self.busy).on_click(cx.listener(|view, _, _, cx| {
-                        view.run("Installing RetroArch…", |_| emu::install_retroarch().map(|()| "RetroArch installed.".into()), cx)
-                    })),
-                )
-            })
-            .child({
-                let (missing, total) = emu::core_status(&self.config);
-                let note = if missing == 0 {
-                    format!("All {total} cores installed.")
+            .child(
+                if folders_exist {
+                    setting_row("ROM folders", "Put each game in its system's folder, then Rescan.")
                 } else {
-                    format!("{missing} of {total} cores missing. Downloads them from libretro.")
-                };
-                setting_row("Cores", &note).child(
-                    Button::new("install-cores")
-                        .label(if missing == 0 { "Installed" } else { "Install" })
-                        .disabled(self.busy || missing == 0)
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.run("Downloading cores…", |config| emu::install_cores(&config).map(|n| format!("Installed {n} new cores.")), cx)
-                        })),
+                    setting_row("ROM folders", "Creates a folder for every supported system.")
+                }
+                .child(self.setting_button(
+                    Setting::RomFolders,
+                    Button::new("rom-folders").label(if folders_exist { "Open" } else { "Create" }),
+                    cx,
+                )),
+            )
+            .child(
+                if retroarch {
+                    setting_row("RetroArch", "Installed. Open it to change its own settings.")
+                } else {
+                    setting_row("RetroArch", "Not installed. Installs with winget, Homebrew or Flatpak.")
+                }
+                .child(self.setting_button(
+                    Setting::RetroArch,
+                    Button::new("retroarch").label(if retroarch { "Open" } else { "Install" }).disabled(self.busy && !retroarch),
+                    cx,
+                )),
+            )
+            .child(
+                setting_row(
+                    "Cores",
+                    &if missing == 0 {
+                        format!("All {total} cores installed.")
+                    } else {
+                        format!("{missing} of {total} cores missing. Downloads them from libretro.")
+                    },
                 )
-            });
+                .child(self.setting_button(
+                    Setting::Cores,
+                    Button::new("cores").label(if missing == 0 { "Installed" } else { "Install" }).disabled(self.busy || missing == 0),
+                    cx,
+                )),
+            );
 
         let mut modes = div().flex().gap_2();
         for (label, glass) in [("Solid", false), ("Glass", true)] {
-            modes = modes.child(
-                Button::new(label)
-                    .label(label)
-                    .selected(self.appearance.glass == glass)
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        view.appearance.glass = glass;
-                        view.save_appearance(window, cx);
-                    })),
-            );
+            modes = modes.child(self.setting_button(
+                Setting::Glass(glass),
+                Button::new(label).label(label).selected(self.appearance.glass == glass),
+                cx,
+            ));
         }
         let mut palettes = div().flex().flex_wrap().justify_end().gap_2();
-        for (name, surface, accent) in [
-            ("Teal", 0x0c1417, 0x92c8e5),
-            ("Graphite", 0x151515, 0xc4c4ce),
-            ("Blue", 0x101a2d, 0x92b9ff),
-            ("Plum", 0x211324, 0xd5a8e3),
-            ("Forest", 0x101f19, 0x91cba6),
-        ] {
-            palettes = palettes.child(
-                Button::new(name)
-                    .label(name)
-                    .selected(self.appearance.surface == surface)
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        view.appearance.surface = surface;
-                        view.appearance.accent = accent;
-                        view.save_appearance(window, cx);
-                    })),
-            );
+        for (i, (name, surface, _)) in PALETTES.into_iter().enumerate() {
+            palettes = palettes.child(self.setting_button(
+                Setting::Palette(i),
+                Button::new(name).label(name).selected(self.appearance.surface == surface),
+                cx,
+            ));
         }
         let looks = card()
             .child(setting_row("Window material", "Glass blurs the desktop behind the window (Windows and macOS).").child(modes))
@@ -597,12 +752,13 @@ impl Hub {
             .flex_col()
             .gap_4()
             .child(div().text_size(px(34.)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
-            .child(div().pt_4().child(heading("Paths")))
-            .child(paths)
+            // Controller-reachable sections first; Paths needs a keyboard anyway.
             .child(div().pt_4().child(heading("Setup")))
             .child(setup)
             .child(div().pt_4().child(heading("Appearance")))
             .child(looks)
+            .child(div().pt_4().child(heading("Paths")))
+            .child(paths)
     }
 
     fn save_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
