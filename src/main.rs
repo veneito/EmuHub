@@ -125,7 +125,14 @@ struct Hub {
     active: bool,
     /// Cards per grid row, measured each frame for up/down navigation.
     columns: usize,
-    grid_scroll: ScrollHandle,
+    /// The game grid only draws the rows on screen (uniform_list), which keeps big libraries smooth.
+    grid_scroll: UniformListScrollHandle,
+    /// Games shown in the grid this frame, in order (filter + search applied).
+    visible_cache: Vec<usize>,
+    /// Each game's cover file if it has one, parallel to `games`, so drawing never touches the disk.
+    covers: Vec<Option<std::path::PathBuf>>,
+    /// Bumped on every rescan so an older cover download pass stops.
+    cover_pass: usize,
     /// Horizontal scroll of the Home rows, so the controller's card stays in view.
     home_scroll: [ScrollHandle; 2],
     /// Vertical scroll of the Home and Settings pages, so the controller's section stays in view.
@@ -272,7 +279,10 @@ impl Hub {
             pad_used: false,
             active: true,
             columns: 1,
-            grid_scroll: ScrollHandle::new(),
+            grid_scroll: UniformListScrollHandle::new(),
+            visible_cache: vec![],
+            covers: vec![],
+            cover_pass: 0,
             home_scroll: [ScrollHandle::new(), ScrollHandle::new()],
             home_page_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
@@ -297,6 +307,7 @@ impl Hub {
 
     fn rescan(&mut self, cx: &mut Context<Self>) {
         self.games = emu::scan(&self.config.roms_dir, &self.systems);
+        self.refresh_covers();
         self.selected = None;
         if self.system.as_deref().is_some_and(|s| !self.games.iter().any(|g| g.system == s)) {
             self.system = None;
@@ -309,18 +320,49 @@ impl Hub {
     }
 
     /// Downloads missing covers one by one in the background, redrawing as each arrives.
-    fn fetch_covers(&self, cx: &mut Context<Self>) {
-        let games = self.games.clone();
+    fn refresh_covers(&mut self) {
+        self.covers = self.games.iter().map(|g| Some(emu::cover_path(g)).filter(|p| p.exists())).collect();
+    }
+
+    fn fetch_covers(&mut self, cx: &mut Context<Self>) {
+        self.cover_pass += 1;
+        let pass = self.cover_pass;
+        // Only games still missing a cover; the rest are already on disk.
+        let missing: Vec<(usize, Game)> =
+            self.games.iter().enumerate().filter(|(i, _)| self.covers[*i].is_none()).map(|(i, g)| (i, g.clone())).collect();
         let recent: Vec<Game> = self.recent().into_iter().map(|i| self.games[i].clone()).collect();
         let key = self.config.steamgriddb_key.clone();
         cx.spawn(async move |this, cx| {
-            for game in games {
+            let mut since_redraw = 0;
+            let count = missing.len();
+            for (n, (index, game)) in missing.into_iter().enumerate() {
                 let key = key.clone();
-                let got = cx.background_executor().spawn(async move { emu::fetch_cover(&game, &key) }).await;
-                if got && this.update(cx, |_, cx| cx.notify()).is_err() {
+                let path = game.path.clone();
+                let got = cx.background_executor().spawn(async move { emu::fetch_cover(&game, &key).then(|| emu::cover_path(&game)) }).await;
+                let Some(cover) = got else { continue };
+                since_redraw += 1;
+                // Redraw every 12 covers (and at the end) instead of after each one.
+                let redraw = since_redraw >= 12 || n + 1 == count;
+                let alive = this.update(cx, |view, cx| {
+                    if view.cover_pass != pass {
+                        return false;
+                    }
+                    if view.games.get(index).is_some_and(|g| g.path == path) {
+                        view.covers[index] = Some(cover);
+                    }
+                    if redraw {
+                        cx.notify();
+                    }
+                    true
+                });
+                if !alive.unwrap_or(false) {
                     return;
                 }
+                if redraw {
+                    since_redraw = 0;
+                }
             }
+            let _ = this.update(cx, |_, cx| cx.notify());
             for game in recent {
                 let got = cx.background_executor().spawn(async move { emu::fetch_snap(&game) }).await;
                 if got && this.update(cx, |_, cx| cx.notify()).is_err() {
@@ -767,7 +809,7 @@ impl Hub {
             None => 0,
         };
         self.selected = Some(visible[pos]);
-        self.grid_scroll.scroll_to_item(pos);
+        self.grid_scroll.scroll_to_item(pos / self.columns.max(1), ScrollStrategy::Center);
     }
 
     /// Runs a slow job (install, download) off the UI thread and shows its result.
@@ -783,6 +825,7 @@ impl Hub {
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
                 view.message = result.unwrap_or_else(|e| e);
+                view.refresh_covers();
                 cx.notify();
             });
         })
@@ -905,74 +948,15 @@ impl Hub {
             Some(id) => system_name(&self.systems, id).to_owned(),
             None => "All games".to_owned(),
         };
-        let accent = self.appearance.accent;
-        let mut grid = div()
-            .id("grid")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.grid_scroll)
-            .flex()
-            .flex_wrap()
-            .content_start()
-            .gap_5()
-            .px_6()
-            .pb_6();
-        for &index in visible {
-            let game = &self.games[index];
-            let cover = emu::cover_path(game);
-            // shortcut: checks the disk on every redraw; keep a set of known covers if libraries get huge.
-            let art = if cover.exists() {
-                img(cover).size_full().object_fit(ObjectFit::Cover).into_any_element()
-            } else {
-                tile(&game.name, 150.).size_full().rounded_none().into_any_element()
-            };
-            let selected = self.selected == Some(index);
-            grid = grid.child(
-                div()
-                    .id(("game", index))
-                    .w(px(150.))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |view, _: &MouseDownEvent, _, cx| {
-                            view.focus = Focus::Grid;
-                            view.open_details(index, cx);
-                        }),
-                    )
-                    .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
-                        view.selected = Some(index);
-                        view.focus = Focus::Grid;
-                        if event.click_count() >= 2 {
-                            view.play(index, cx);
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .w(px(150.))
-                            .h(px(225.))
-                            .rounded_lg()
-                            .overflow_hidden()
-                            .border_2()
-                            // Bright when the controller is in the grid, dim while it's in the side menu.
-                            .border_color(match (selected, self.focus == Focus::Grid) {
-                                (true, true) => rgb(accent).into(),
-                                (true, false) => rgba((accent << 8) | 0x60),
-                                _ => rgba(0xffffff14),
-                            })
-                            .child(art),
-                    )
-                    .child(div().text_size(px(14.)).line_clamp(2).child(game.name.clone()))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(system_name(&self.systems, &game.system).to_owned())),
-            );
-        }
-        if visible.is_empty() {
-            grid = grid.child(div().text_color(rgb(MUTED)).child("No games here."));
-        }
+        let rows = visible.len().div_ceil(self.columns.max(1));
+        let grid = if visible.is_empty() {
+            div().px_6().text_color(rgb(MUTED)).child("No games here.").into_any_element()
+        } else {
+            uniform_list("grid", rows, cx.processor(|view: &mut Hub, range: std::ops::Range<usize>, _, cx| range.map(|row| view.grid_row(row, cx)).collect::<Vec<_>>()))
+                .flex_1()
+                .track_scroll(self.grid_scroll.clone())
+                .into_any_element()
+        };
         div()
             .id("library")
             .size_full()
@@ -1225,22 +1209,76 @@ impl Hub {
     }
 
     /// Cover art, or the letter tile when there isn't any yet.
-    fn cover(&self, game: &Game, size: f32) -> AnyElement {
-        let cover = emu::cover_path(game);
-        if cover.exists() {
-            img(cover).size_full().object_fit(ObjectFit::Cover).into_any_element()
-        } else {
-            tile(&game.name, size).size_full().rounded_none().into_any_element()
+    fn cover(&self, index: usize, size: f32) -> AnyElement {
+        match &self.covers[index] {
+            Some(cover) => img(cover.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+            None => tile(&self.games[index].name, size).size_full().rounded_none().into_any_element(),
         }
+    }
+
+    /// One row of the game grid. Rows have a fixed height, which uniform_list needs.
+    fn grid_row(&self, row: usize, cx: &mut Context<Self>) -> Div {
+        let start = row * self.columns.max(1);
+        let end = (start + self.columns.max(1)).min(self.visible_cache.len());
+        let accent = self.appearance.accent;
+        let mut cards = div().h(px(325.)).flex().gap_5().px_6();
+        for &index in &self.visible_cache[start..end] {
+            let game = &self.games[index];
+            let selected = self.selected == Some(index);
+            cards = cards.child(
+                div()
+                    .id(("game", index))
+                    .w(px(150.))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                            view.focus = Focus::Grid;
+                            view.open_details(index, cx);
+                        }),
+                    )
+                    .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
+                        view.selected = Some(index);
+                        view.focus = Focus::Grid;
+                        if event.click_count() >= 2 {
+                            view.play(index, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(150.))
+                            .h(px(225.))
+                            .flex_none()
+                            .rounded_lg()
+                            .overflow_hidden()
+                            .border_2()
+                            // Bright when the controller is in the grid, dim while it's in the side menu.
+                            .border_color(match (selected, self.focus == Focus::Grid) {
+                                (true, true) => rgb(accent).into(),
+                                (true, false) => rgba((accent << 8) | 0x60),
+                                _ => rgba(0xffffff14),
+                            })
+                            .child(self.cover(index, 150.)),
+                    )
+                    .child(div().h(px(40.)).text_size(px(14.)).line_clamp(2).child(game.name.clone()))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(system_name(&self.systems, &game.system).to_owned())),
+            );
+        }
+        cards
     }
 
     fn home_page(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let recent = self.recent();
-        let hero = match self.focus {
+        let hero_index = match self.focus {
             Focus::Home(0, c) => recent.get(c),
             _ => recent.first(),
         }
-        .map(|&i| &self.games[i]);
+        .copied();
+        let hero = hero_index.map(|i| &self.games[i]);
 
         // Hero: in-game screenshot on the left, title and facts on the right, like the old EmuHub's showcase.
         let hero_art = match hero {
@@ -1248,13 +1286,13 @@ impl Hub {
                 img(emu::snap_path(game)).size_full().object_fit(ObjectFit::Cover).into_any_element()
             }
             // No screenshot yet: show the whole box, centered, rather than a stretched crop of it.
-            Some(game) => div()
+            Some(_) => div()
                 .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
                 .bg(rgba(0x00000040))
-                .child(div().w(px(180.)).h(px(270.)).rounded_lg().overflow_hidden().child(self.cover(game, 180.)))
+                .child(div().w(px(180.)).h(px(270.)).rounded_lg().overflow_hidden().child(self.cover(hero_index.unwrap(), 180.)))
                 .into_any_element(),
             None => tile("EmuHub", 280.).size_full().rounded_none().into_any_element(),
         };
@@ -1320,12 +1358,11 @@ impl Hub {
 
         let mut continue_row = div().id("recent-row").flex().gap_4().px_6().pb_2().overflow_x_scroll().track_scroll(&self.home_scroll[0]);
         for (col, &index) in recent.iter().enumerate() {
-            let game = &self.games[index];
             continue_row = continue_row.child(
                 self.ring(div().id(("recent", col)).w(px(120.)).h(px(180.)).flex_none().rounded_lg().overflow_hidden(), self.focus == Focus::Home(0, col))
                     .cursor_pointer()
                     .bg(rgba(0xffffff0a))
-                    .child(self.cover(game, 120.))
+                    .child(self.cover(index, 120.))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |view, _: &MouseDownEvent, _, cx| {
@@ -1473,6 +1510,7 @@ impl Render for Hub {
         let content = window.viewport_size().width / px(1.) - chrome;
         self.columns = ((content + 20.) / 170.).floor().max(1.) as usize;
         let visible = self.visible(cx);
+        self.visible_cache = visible.clone();
         let page = match self.view {
             View::Home => self.home_page(cx),
             View::Library => self.library_page(&visible, cx),

@@ -171,6 +171,10 @@ fn scan_dir(dir: &Path, system: &System, games: &mut Vec<Game>) {
         let ext = ext_of(&path);
         if path.is_file() && system.exts.contains(&ext) && (!has_playlist || ext == "m3u") {
             let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+            // No-Intro sets include BIOS dumps named "[BIOS] ..."; they aren't games.
+            if name.to_lowercase().starts_with("[bios]") {
+                continue;
+            }
             games.push(Game { system: system.id.clone(), name, path });
         }
     }
@@ -721,6 +725,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("snes")).unwrap();
         std::fs::write(dir.join("snes/Zelda.SFC"), b"").unwrap();
         std::fs::write(dir.join("snes/readme.txt"), b"").unwrap();
+        std::fs::write(dir.join("snes/[BIOS] Super Game Boy (USA).sfc"), b"").unwrap();
         let games = scan(&dir, &systems());
         assert_eq!(games.len(), 1);
         assert_eq!(games[0].name, "Zelda");
