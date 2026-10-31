@@ -9,6 +9,7 @@ A low-memory emulation hub for Windows, macOS and Linux/SteamOS (Rust + GPUI). I
 - Installs RetroArch (winget / Homebrew / Flatpak) and the needed cores from libretro's buildbot.
 - Box art from libretro-thumbnails, with SteamGridDB as an optional fallback; cached on disk.
 - Uses EmuDeck's `Emulation/bios` and `Emulation/saves/retroarch` folders when present.
+- Controller support: D-pad or left stick moves, A plays, B goes back to All games (or leaves Settings), LB/RB switch systems. Ignored while another window, like a running game, has focus.
 
 ## Build
 

@@ -2,8 +2,10 @@
 mod appearance;
 mod assets;
 mod emu;
+mod gamepad;
 
 use emu::{Config, Game, System};
+use gamepad::Pad;
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Root, Selectable, Theme, ThemeMode, TitleBar,
@@ -35,6 +37,11 @@ struct Hub {
     selected: Option<usize>,
     sidebar_open: bool,
     busy: bool,
+    /// Controller input is ignored while another window (e.g. a running game) has focus.
+    active: bool,
+    /// Cards per grid row, measured each frame for up/down navigation.
+    columns: usize,
+    grid_scroll: ScrollHandle,
     message: String,
     appearance: appearance::Appearance,
 }
@@ -139,6 +146,18 @@ impl Hub {
             _ => {}
         })
         .detach();
+        cx.observe_window_activation(window, |view, window, _| view.active = window.is_window_active()).detach();
+        let pad = gamepad::spawn();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
+                let actions = std::mem::take(&mut *pad.lock().unwrap());
+                if !actions.is_empty() && this.update(cx, |view, cx| actions.into_iter().for_each(|a| view.on_pad(a, cx))).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
 
         let mut hub = Self {
             query,
@@ -154,6 +173,9 @@ impl Hub {
             selected: None,
             sidebar_open: true,
             busy: false,
+            active: true,
+            columns: 1,
+            grid_scroll: ScrollHandle::new(),
             message: String::new(),
             appearance,
         };
@@ -208,6 +230,52 @@ impl Hub {
             Err(error) => error,
         };
         cx.notify();
+    }
+
+    fn on_pad(&mut self, action: Pad, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
+        match action {
+            Pad::PrevTab | Pad::NextTab => {
+                let mut tabs: Vec<Option<String>> = vec![None];
+                tabs.extend(self.systems.iter().filter(|s| self.games.iter().any(|g| g.system == s.id)).map(|s| Some(s.id.clone())));
+                let at = tabs.iter().position(|t| *t == self.system).unwrap_or(0);
+                let next = if action == Pad::NextTab { (at + 1) % tabs.len() } else { (at + tabs.len() - 1) % tabs.len() };
+                self.system = tabs[next].clone();
+                self.view = View::Library;
+                self.selected = None;
+            }
+            Pad::Back if self.view == View::Settings => self.view = View::Library,
+            Pad::Back => {
+                self.system = None;
+                self.selected = None;
+            }
+            _ if self.view != View::Library => return,
+            Pad::Confirm => match self.selected {
+                Some(i) => self.play(i, cx),
+                None => self.move_selection(0, cx),
+            },
+            Pad::Left => self.move_selection(-1, cx),
+            Pad::Right => self.move_selection(1, cx),
+            Pad::Up => self.move_selection(-(self.columns as isize), cx),
+            Pad::Down => self.move_selection(self.columns as isize, cx),
+        }
+        cx.notify();
+    }
+
+    /// Moves the selection through the visible games, starting at the first one if nothing is selected.
+    fn move_selection(&mut self, by: isize, cx: &mut Context<Self>) {
+        let visible = self.visible(cx);
+        if visible.is_empty() {
+            return;
+        }
+        let pos = match self.selected.and_then(|i| visible.iter().position(|&v| v == i)) {
+            Some(pos) => (pos as isize + by).clamp(0, visible.len() as isize - 1) as usize,
+            None => 0,
+        };
+        self.selected = Some(visible[pos]);
+        self.grid_scroll.scroll_to_item(pos);
     }
 
     /// Runs a slow job (install, download) off the UI thread and shows its result.
@@ -332,7 +400,18 @@ impl Hub {
             None => "All games".to_owned(),
         };
         let accent = self.appearance.accent;
-        let mut grid = div().flex().flex_wrap().gap_5().px_6().pb_6();
+        let mut grid = div()
+            .id("grid")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.grid_scroll)
+            .flex()
+            .flex_wrap()
+            .content_start()
+            .gap_5()
+            .px_6()
+            .pb_6();
         for &index in visible {
             let game = &self.games[index];
             let cover = emu::cover_path(game);
@@ -378,7 +457,6 @@ impl Hub {
         div()
             .id("library")
             .size_full()
-            .overflow_y_scroll()
             .bg(self.appearance.fill(0x0c1417))
             .flex()
             .flex_col()
@@ -561,7 +639,11 @@ impl Hub {
 }
 
 impl Render for Hub {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Sidebar, window padding, border and grid padding; each card is 150px plus a 20px gap.
+        let chrome = if self.sidebar_open { 256. } else { 0. } + 16. + 4. + 2. + 48.;
+        let content = window.viewport_size().width / px(1.) - chrome;
+        self.columns = ((content + 20.) / 170.).floor().max(1.) as usize;
         let visible = self.visible(cx);
         let page = match self.view {
             View::Library => self.library_page(&visible, cx),
