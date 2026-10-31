@@ -93,6 +93,23 @@ jobs:
           ln -s /Applications dmg/Applications
           hdiutil create -volname EmuHub -srcfolder dmg -ov -format UDZO EmuHub.dmg
 
+      # Per-user installer with shortcut choices; in-app updates run it silently.
+      - name: Package EmuHub-Setup.exe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          $env:EMUHUB_VERSION = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $env:EMUHUB_EXE = "$PWD\target\release\emuhub.exe"
+          $env:EMUHUB_DIST = "$PWD\dist"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "scripts\windows\emuhub.iss"
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: emuhub-Setup
+          path: dist/EmuHub-Setup.exe
+
       # One-file Linux app with icon and menu entry (what SteamOS/EmuDeck users expect).
       - name: Package AppImage
         if: runner.os == 'Linux'
@@ -138,4 +155,7 @@ jobs:
           mv emuhub-macOS/EmuHub.dmg EmuHub.dmg
           mv emuhub-Linux/emuhub emuhub-linux
           mv emuhub-AppImage/EmuHub-x86_64.AppImage EmuHub-x86_64.AppImage
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "EmuHub ${GITHUB_REF_NAME#v}" --notes-file repo/.github/release-notes.md --generate-notes --latest             emuhub-windows.exe EmuHub.dmg EmuHub-x86_64.AppImage emuhub-linux
+          mv emuhub-Setup/EmuHub-Setup.exe EmuHub-Setup.exe
+          # EmuHub checks every update against this before installing it.
+          sha256sum EmuHub-Setup.exe emuhub-windows.exe EmuHub.dmg EmuHub-x86_64.AppImage emuhub-linux > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "EmuHub ${GITHUB_REF_NAME#v}" --notes-file repo/.github/release-notes.md --generate-notes --latest EmuHub-Setup.exe emuhub-windows.exe EmuHub.dmg EmuHub-x86_64.AppImage emuhub-linux SHA256SUMS

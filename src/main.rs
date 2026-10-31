@@ -3,6 +3,7 @@ mod appearance;
 mod assets;
 mod emu;
 mod gamepad;
+mod update;
 
 use emu::{Config, Game, System};
 use gamepad::Pad;
@@ -67,7 +68,7 @@ enum Setting {
     EmulatorSite(usize),
     /// Create and open Emulation/tools/<emulator>, to unzip it into.
     EmulatorFolder(usize),
-    /// Open the releases page to download a newer EmuHub.
+    /// Install the newer EmuHub (or open the Releases page when this copy can't update itself).
     Update,
 }
 
@@ -104,6 +105,14 @@ fn settings_items() -> Vec<Setting> {
     items.extend((0..PALETTES.len()).map(Setting::Palette));
     items.push(Setting::Update);
     items
+}
+
+/// The top-right update popup.
+enum UpdateState {
+    Hidden,
+    Offer,
+    Working(&'static str),
+    Failed(String),
 }
 
 struct Hub {
@@ -146,8 +155,9 @@ struct Hub {
     /// When each game was last played, for Continue Playing.
     history: std::collections::HashMap<std::path::PathBuf, u64>,
     message: String,
-    /// The newer release's version, once the startup check finds one.
-    update: Option<String>,
+    /// A newer release, once the startup check finds one, and the top-right popup's state.
+    update: Option<update::Release>,
+    update_state: UpdateState,
     appearance: appearance::Appearance,
 }
 
@@ -310,16 +320,26 @@ impl Hub {
             history: emu::load_history(),
             message: String::new(),
             update: None,
+            update_state: UpdateState::Hidden,
             appearance,
         };
         hub.rescan(cx);
-        // Only asks GitHub for the latest version number; nothing is downloaded or installed.
+        // Only asks GitHub whether there's a newer version; nothing downloads until Update is pressed.
+        let skipped = hub.config.skipped_update.clone();
         cx.spawn(async move |this, cx| {
-            let Some(version) = cx.background_executor().spawn(async { emu::newer_release() }).await else { return };
+            let Some(release) = cx.background_executor().spawn(async move { update::check(skipped.as_deref()) }).await else { return };
             let _ = this.update(cx, |view, cx| {
-                view.message = format!("EmuHub {version} is available. Settings → Download.");
-                view.update = Some(version);
+                view.update = Some(release);
+                view.update_state = UpdateState::Offer;
                 cx.notify();
+            });
+            // The popup steps aside after a while; Settings keeps the Update button.
+            cx.background_executor().timer(std::time::Duration::from_secs(20)).await;
+            let _ = this.update(cx, |view, cx| {
+                if matches!(view.update_state, UpdateState::Offer) {
+                    view.update_state = UpdateState::Hidden;
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -857,7 +877,7 @@ impl Hub {
                     .err()
                     .unwrap_or_default();
             }
-            Setting::Update => self.message = emu::open_url(emu::RELEASES_URL).err().unwrap_or_default(),
+            Setting::Update => self.start_update(cx),
             Setting::EmulatorSite(i) => self.message = emu::open_url(emu::EMULATORS[i].site).err().unwrap_or_default(),
             Setting::Palette(i) => {
                 let (_, surface, accent) = PALETTES[i];
@@ -897,6 +917,107 @@ impl Hub {
     }
 
     /// Runs a slow job (install, download) off the UI thread and shows its result.
+    /// Update pressed: downloads and checks the new version, installs it and quits so it can restart.
+    /// A copy that can't update itself (portable exe, bare Linux binary) opens the Releases page instead.
+    fn start_update(&mut self, cx: &mut Context<Self>) {
+        let release = match self.update.clone() {
+            Some(release) if release.installs_itself() => release,
+            _ => {
+                self.message = emu::open_url(update::RELEASES_URL).err().unwrap_or_default();
+                return;
+            }
+        };
+        if matches!(self.update_state, UpdateState::Working(_)) || self.game_running() {
+            return;
+        }
+        self.update_state = UpdateState::Working("Downloading and checking the update…");
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { update::download_verified(&release).and_then(|file| update::install(&file, &update::Install::detect())) })
+                .await;
+            let _ = this.update(cx, |view, cx| match result {
+                Ok(()) => cx.quit(),
+                Err(error) => {
+                    view.update_state = UpdateState::Failed(error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Skip: this version isn't offered again; a newer one will be.
+    fn skip_update(&mut self, cx: &mut Context<Self>) {
+        if let Some(release) = self.update.take() {
+            self.config.skipped_update = Some(release.version);
+            let _ = self.config.save();
+        }
+        self.update_state = UpdateState::Hidden;
+        cx.notify();
+    }
+
+    /// Top-right card: "EmuHub X is available" with Skip / Update, then progress or the error.
+    fn update_popup(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let release = self.update.as_ref()?;
+        let failed = matches!(self.update_state, UpdateState::Failed(_));
+        let (title, note) = match &self.update_state {
+            UpdateState::Hidden => return None,
+            UpdateState::Offer => (format!("EmuHub {} is available", release.version), "With a controller: Settings → Update.".to_owned()),
+            UpdateState::Working(step) => (format!("Updating to {}", release.version), step.to_string()),
+            UpdateState::Failed(error) => ("Update failed".to_owned(), error.clone()),
+        };
+        let mut buttons = div().flex().justify_end().gap_2();
+        if !matches!(self.update_state, UpdateState::Working(_)) {
+            let main_label = if failed || !release.installs_itself() { "Open releases" } else { "Update" };
+            buttons = buttons
+                .child(Button::new("popup-skip").label(if failed { "Close" } else { "Skip" }).on_click(cx.listener(move |view, _, _, cx| {
+                    if failed {
+                        view.update_state = UpdateState::Hidden;
+                        cx.notify();
+                    } else {
+                        view.skip_update(cx);
+                    }
+                })))
+                .child(Button::new("popup-update").primary().label(main_label).on_click(cx.listener(move |view, _, _, cx| {
+                    if failed {
+                        view.message = emu::open_url(update::RELEASES_URL).err().unwrap_or_default();
+                    } else {
+                        view.start_update(cx);
+                    }
+                })));
+        }
+        Some(
+            div()
+                .absolute()
+                .top(px(48.))
+                .right(px(16.))
+                .w(px(320.))
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(self.appearance.accent))
+                // Solid even in Glass mode so the page doesn't show through the text.
+                .bg(appearance::Appearance { glass: false, ..self.appearance }.fill(0x101e23))
+                .shadow_lg()
+                .occlude()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(icon("refresh", 16., rgb(self.appearance.accent)))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(title)),
+                )
+                .child(div().text_xs().text_color(rgb(MUTED)).child(note))
+                .child(buttons),
+        )
+    }
+
     fn run(&mut self, label: &str, job: impl FnOnce(Config) -> Result<String, String> + Send + 'static, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -1185,13 +1306,13 @@ impl Hub {
             .child(setting_row(
                 &format!("EmuHub {}", env!("CARGO_PKG_VERSION")),
                 &match &self.update {
-                    Some(version) => format!("Version {version} is available."),
+                    Some(release) => format!("Version {} is available.", release.version),
                     None => "Up to date, or the update check couldn't reach GitHub.".into(),
                 },
             )
             .child(self.setting_button(
                 Setting::Update,
-                Button::new("update").label(if self.update.is_some() { "Download" } else { "Releases" }).selected(self.update.is_some()),
+                Button::new("update").label(if self.update.is_some() { "Update" } else { "Releases" }).selected(self.update.is_some()),
                 cx,
             )));
 
@@ -1640,6 +1761,7 @@ impl Render for Hub {
                 .child(page),
         );
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -1674,6 +1796,7 @@ impl Render for Hub {
                 None => body.into_any_element(),
             })
             .child(self.bottom_bar())
+            .children(self.update_popup(cx))
     }
 }
 

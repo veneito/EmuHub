@@ -33,6 +33,9 @@ pub struct Config {
     /// Standalone emulator programs picked in Settings, by emulator id.
     #[serde(default)]
     pub emulators: std::collections::HashMap<String, PathBuf>,
+    /// The update version the user chose to skip; it isn't offered again.
+    #[serde(default)]
+    pub skipped_update: Option<String>,
 }
 
 #[derive(Clone)]
@@ -89,7 +92,7 @@ fn default_config(home: &Path) -> Config {
     let steamgriddb_key = String::new();
     if cfg!(target_os = "windows") {
         let ra = PathBuf::from(r"C:\RetroArch-Win64");
-        Config { roms_dir, retroarch_cmd: vec![ra.join("retroarch.exe").display().to_string()], cores_dir: ra.join("cores"), steamgriddb_key, emulators: Default::default() }
+        Config { roms_dir, retroarch_cmd: vec![ra.join("retroarch.exe").display().to_string()], cores_dir: ra.join("cores"), steamgriddb_key, emulators: Default::default(), skipped_update: None }
     } else if cfg!(target_os = "macos") {
         Config {
             roms_dir,
@@ -97,6 +100,7 @@ fn default_config(home: &Path) -> Config {
             cores_dir: home.join("Library/Application Support/RetroArch/cores"),
             steamgriddb_key,
             emulators: Default::default(),
+            skipped_update: None,
         }
     } else {
         // SteamOS/EmuDeck installs RetroArch as a Flatpak.
@@ -106,6 +110,7 @@ fn default_config(home: &Path) -> Config {
             cores_dir: home.join(".var/app/org.libretro.RetroArch/config/retroarch/cores"),
             steamgriddb_key,
             emulators: Default::default(),
+            skipped_update: None,
         }
     }
 }
@@ -207,22 +212,6 @@ pub fn add_to_app_menu() {
     if std::fs::read_to_string(&desktop).ok().as_deref() != Some(entry.as_str()) {
         let _ = write_atomic(&desktop, entry.as_bytes());
     }
-}
-
-pub const RELEASES_URL: &str = "https://github.com/veneito/EmuHub/releases/latest";
-
-/// The latest release's version (like "0.2.0") if it's newer than this build. Reads only the tag name
-/// from GitHub's API over HTTPS; any error just means no update is shown.
-pub fn newer_release() -> Option<String> {
-    let json: serde_json::Value = serde_json::from_slice(&download("https://api.github.com/repos/veneito/EmuHub/releases/latest", None).ok()?).ok()?;
-    let latest = json["tag_name"].as_str()?.trim_start_matches('v');
-    is_newer(latest, env!("CARGO_PKG_VERSION")).then(|| latest.to_owned())
-}
-
-/// Compares "1.10.0" > "1.9.2" by number, part by part.
-fn is_newer(latest: &str, current: &str) -> bool {
-    let parts = |v: &str| v.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
-    parts(latest) > parts(current)
 }
 
 pub fn open_url(url: &str) -> Result<(), String> {
@@ -512,7 +501,7 @@ fn buildbot_platform() -> &'static str {
     }
 }
 
-fn download(url: &str, auth: Option<&str>) -> Result<Vec<u8>, String> {
+pub(crate) fn download(url: &str, auth: Option<&str>) -> Result<Vec<u8>, String> {
     let mut req = ureq::get(url);
     if let Some(auth) = auth {
         req = req.set("Authorization", auth);
@@ -523,7 +512,7 @@ fn download(url: &str, auth: Option<&str>) -> Result<Vec<u8>, String> {
 }
 
 /// Writes through a temp file so a failed download never leaves a half-written file behind.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("part");
     std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
@@ -947,14 +936,6 @@ mod tests {
 </dict>";
         assert_eq!(plist_version(plist).as_deref(), Some("1.22.2"));
         assert_eq!(plist_version("<dict></dict>"), None);
-    }
-
-    #[test]
-    fn versions_compare_by_number() {
-        assert!(is_newer("0.10.0", "0.9.1"));
-        assert!(is_newer("0.2.0", "0.1.0"));
-        assert!(!is_newer("0.1.0", "0.1.0"));
-        assert!(!is_newer("garbage", "0.1.0"));
     }
 
     #[test]

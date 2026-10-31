@@ -22,7 +22,7 @@ I wanted one app that sets up emulators like EmuDeck, shows my library like Play
 - Installs RetroArch (winget / Homebrew / Flatpak) and the needed cores from libretro's buildbot, and shows what's already installed.
 - Standalone emulators: Eden for Switch is found in `Emulation/tools/eden`, the usual install places, or picked by hand. EmuHub links to its official site and doesn't download it. Keys and firmware are copied from `Emulation/bios/eden` on first launch.
 - Uses EmuDeck's `Emulation/bios` and `Emulation/saves/retroarch` folders when present.
-- Tells you when a new version is out (Settings → Download).
+- Updates itself: a popup offers each new version, and Update downloads it, checks it and restarts EmuHub on it (installer, Mac app and AppImage; the portable copies open the Releases page).
 
 **Playing**
 - RetroArch opens fullscreen; one game runs at a time. Intel Macs use the OpenGL driver, which runs smoother there.
@@ -38,7 +38,7 @@ I wanted one app that sets up emulators like EmuDeck, shows my library like Play
 
 Get the latest version from [Releases](https://github.com/veneito/EmuHub/releases/latest):
 
-- **Windows:** `emuhub-windows.exe`.
+- **Windows:** `EmuHub-Setup.exe`. Installs for your user, no admin needed, with optional desktop and Start menu shortcuts. Windows SmartScreen may warn the first time because it isn't code-signed: More info → Run anyway. `emuhub-windows.exe` is a portable copy.
 - **macOS:** `EmuHub.dmg` (universal: Apple Silicon and Intel). Drag EmuHub to Applications. It isn't notarized, so approve it once: right-click → Open (macOS 14 and older) or System Settings → Privacy & Security → Open Anyway (macOS 15+).
 - **Linux / SteamOS:** `EmuHub-x86_64.AppImage` (one file with an icon; Gear Lever or AppImageLauncher adds it to the app menu), or the bare `emuhub-linux`. Make it executable first (`chmod +x`). On Arch, install `libxkbcommon-x11 wayland vulkan-icd-loader fontconfig freetype2 alsa-lib` and your GPU's Vulkan driver. Add it to Steam as a non-Steam game to use it in Game Mode.
 
