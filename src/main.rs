@@ -76,9 +76,13 @@ struct Details {
     candidates: Option<Vec<emu::Candidate>>,
     loading: bool,
     focus: usize,
+    /// The cover choices scroll on their own, following the controller.
+    scroll: ScrollHandle,
 }
 
 const DETAIL_BUTTONS: usize = 3;
+/// Cover choices per row: the 820px panel minus padding fits six 110px tiles with 16px gaps.
+const CHOICE_COLUMNS: usize = 6;
 
 const PALETTES: [(&str, u32, u32); 5] = [
     ("Teal", 0x0c1417, 0x92c8e5),
@@ -124,6 +128,9 @@ struct Hub {
     grid_scroll: ScrollHandle,
     /// Horizontal scroll of the Home rows, so the controller's card stays in view.
     home_scroll: [ScrollHandle; 2],
+    /// Vertical scroll of the Home and Settings pages, so the controller's section stays in view.
+    home_page_scroll: ScrollHandle,
+    settings_scroll: ScrollHandle,
     /// When each game was last played, for Continue Playing.
     history: std::collections::HashMap<std::path::PathBuf, u64>,
     message: String,
@@ -217,7 +224,8 @@ impl Hub {
         // shortcut: splits on spaces, so a RetroArch path containing spaces won't work; add a proper args field if needed.
         let retroarch_cmd = field(config.retroarch_cmd.join(" "));
         let cores_dir = field(config.cores_dir.display().to_string());
-        let steamgriddb_key = field(config.steamgriddb_key.clone());
+        // Hidden like a password, with an eye button to show it while typing.
+        let steamgriddb_key = cx.new(|cx| InputState::new(window, cx).masked(true).default_value(config.steamgriddb_key.clone()));
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search games"));
         cx.subscribe_in(&query, window, |view, _, event, _, cx| match event {
             InputEvent::PressEnter { .. } => {
@@ -266,6 +274,8 @@ impl Hub {
             columns: 1,
             grid_scroll: ScrollHandle::new(),
             home_scroll: [ScrollHandle::new(), ScrollHandle::new()],
+            home_page_scroll: ScrollHandle::new(),
+            settings_scroll: ScrollHandle::new(),
             history: emu::load_history(),
             message: String::new(),
             appearance,
@@ -404,6 +414,7 @@ impl Hub {
                 self.show(&menu[i]);
                 if menu[i] == MenuItem::Settings {
                     self.focus = Focus::Settings(0);
+                    self.scroll_settings_to(0);
                 } else if menu[i] == MenuItem::Home {
                     self.enter_home();
                 } else if !self.visible(cx).is_empty() {
@@ -433,8 +444,11 @@ impl Hub {
             (Focus::Grid, Pad::Down) => self.move_selection(self.columns as isize, cx),
             // Settings: up/down through the buttons, X presses, O or Left returns to the menu.
             (Focus::Settings(_), Pad::Back | Pad::Left) => self.focus = Focus::Menu(self.current_menu()),
-            (Focus::Settings(j), Pad::Up) => self.focus = Focus::Settings(j.saturating_sub(1)),
-            (Focus::Settings(j), Pad::Down) => self.focus = Focus::Settings((j + 1).min(settings_items().len() - 1)),
+            (Focus::Settings(j), Pad::Up | Pad::Down) => {
+                let j = if action == Pad::Up { j.saturating_sub(1) } else { (j + 1).min(settings_items().len() - 1) };
+                self.focus = Focus::Settings(j);
+                self.scroll_settings_to(j);
+            }
             (Focus::Settings(j), Pad::Confirm) => self.apply_setting(settings_items()[j], window, cx),
             (Focus::Settings(_), Pad::Right | Pad::Options) => {}
         }
@@ -443,7 +457,7 @@ impl Hub {
 
     fn open_details(&mut self, game: usize, cx: &mut Context<Self>) {
         self.selected = Some(game);
-        self.details = Some(Details { game, candidates: None, loading: false, focus: 0 });
+        self.details = Some(Details { game, candidates: None, loading: false, focus: 0, scroll: ScrollHandle::new() });
         cx.notify();
     }
 
@@ -451,15 +465,26 @@ impl Hub {
     fn details_pad(&mut self, action: Pad, cx: &mut Context<Self>) {
         let Some(details) = &mut self.details else { return };
         let count = DETAIL_BUTTONS + details.candidates.as_ref().map_or(0, Vec::len);
-        match action {
-            Pad::Back | Pad::Options => self.details = None,
-            Pad::Left | Pad::Up => details.focus = details.focus.saturating_sub(1),
-            Pad::Right | Pad::Down => details.focus = (details.focus + 1).min(count - 1),
-            Pad::Confirm => {
-                let focus = details.focus;
-                self.details_action(focus, cx)
+        let focus = details.focus;
+        // Buttons are 0..3 in one row; covers follow in rows of CHOICE_COLUMNS.
+        let next = match action {
+            Pad::Back | Pad::Options => {
+                self.details = None;
+                return;
             }
-            Pad::PrevTab | Pad::NextTab => {}
+            Pad::Confirm => return self.details_action(focus, cx),
+            Pad::PrevTab | Pad::NextTab => return,
+            Pad::Left => focus.saturating_sub(1),
+            Pad::Right => (focus + 1).min(count - 1),
+            Pad::Up if focus < DETAIL_BUTTONS => focus,
+            Pad::Up if focus < DETAIL_BUTTONS + CHOICE_COLUMNS => 1, // first row of covers → Change cover
+            Pad::Up => focus - CHOICE_COLUMNS,
+            Pad::Down if focus < DETAIL_BUTTONS => DETAIL_BUTTONS.min(count - 1),
+            Pad::Down => (focus + CHOICE_COLUMNS).min(count - 1),
+        };
+        details.focus = next;
+        if next >= DETAIL_BUTTONS {
+            details.scroll.scroll_to_item(next - DETAIL_BUTTONS);
         }
     }
 
@@ -557,7 +582,14 @@ impl Hub {
         if details.loading {
             panel = panel.child(div().text_color(rgb(MUTED)).child("Finding covers…"));
         } else if let Some(candidates) = &details.candidates {
-            let mut choices = div().flex().flex_wrap().gap_4();
+            let mut choices = div()
+                .id("cover-choices")
+                .max_h(px(290.))
+                .overflow_y_scroll()
+                .track_scroll(&details.scroll)
+                .flex()
+                .flex_wrap()
+                .gap_4();
             for (n, choice) in candidates.iter().enumerate() {
                 let item = DETAIL_BUTTONS + n;
                 choices = choices.child(
@@ -577,9 +609,9 @@ impl Hub {
                 );
             }
             panel = panel.child(heading("Choose a cover")).child(if candidates.is_empty() {
-                div().text_color(rgb(MUTED)).child("No other covers found. Add a SteamGridDB key in Settings for more choices.")
+                div().text_color(rgb(MUTED)).child("No other covers found. Add a SteamGridDB key in Settings for more choices.").into_any_element()
             } else {
-                choices
+                choices.into_any_element()
             });
         }
 
@@ -602,6 +634,18 @@ impl Hub {
     fn grid_position(&self, cx: &App) -> Option<usize> {
         let selected = self.selected?;
         self.visible(cx).iter().position(|&v| v == selected)
+    }
+
+    /// Scrolls Settings so the card holding button `j` is visible (the page's children are
+    /// title, then a heading and a card per section; see settings_page).
+    fn scroll_settings_to(&self, j: usize) {
+        let child = match settings_items()[j] {
+            _ if j == 0 => 0, // first button: show the page title too
+            Setting::EmulationFolder | Setting::RomFolders | Setting::RetroArch | Setting::Cores => 2,
+            Setting::EmulatorFolder(_) | Setting::PickEmulator(_) | Setting::EmulatorSite(_) => 4,
+            Setting::Glass(_) | Setting::Palette(_) => 6,
+        };
+        self.settings_scroll.scroll_to_item(child);
     }
 
     /// What each Settings button does, for both mouse clicks and the controller.
@@ -972,7 +1016,7 @@ impl Hub {
             .child(setting_row("ROMs folder", "One subfolder per system, EmuDeck style (roms/snes, roms/gba…).").child(div().w(px(360.)).child(Input::new(&self.roms_dir))))
             .child(setting_row("RetroArch command", "Program and arguments, separated by spaces.").child(div().w(px(360.)).child(Input::new(&self.retroarch_cmd))))
             .child(setting_row("Cores folder", "Where RetroArch keeps its cores.").child(div().w(px(360.)).child(Input::new(&self.cores_dir))))
-            .child(setting_row("SteamGridDB API key", "Optional. Fills in covers libretro doesn't have. steamgriddb.com → Preferences → API.").child(div().w(px(360.)).child(Input::new(&self.steamgriddb_key))))
+            .child(setting_row("SteamGridDB API key", "Optional. Fills in covers libretro doesn't have. steamgriddb.com → Preferences → API.").child(div().w(px(360.)).child(Input::new(&self.steamgriddb_key).mask_toggle())))
             .child(setting_row("Save changes", "").child(
                 Button::new("save").primary().label("Save").on_click(cx.listener(|view, _, _, cx| view.save_settings(cx))),
             ));
@@ -1072,6 +1116,7 @@ impl Hub {
             .id("settings-page")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.settings_scroll)
             .bg(self.appearance.fill(0x0c1417))
             .p_8()
             .flex()
@@ -1123,6 +1168,18 @@ impl Hub {
         if let Some(row) = (0..2).find(|&r| self.home_row_len(r) > 0) {
             self.focus = Focus::Home(row, 0);
             self.home_scroll[row].scroll_to_item(0);
+            self.scroll_home_to(row);
+        }
+    }
+
+    /// Scrolls Home so row `row` is visible; the top row also brings the hero back into view.
+    fn scroll_home_to(&self, row: usize) {
+        let has_recent = !self.recent().is_empty();
+        let child = if row == 0 || !has_recent { 0 } else { 3 }; // hero, divider, Continue Playing, Systems
+        self.home_page_scroll.scroll_to_item(child);
+        if child == 3 {
+            // scroll_to_item only reveals the row's top part when it's taller than what's left; Systems is the last row.
+            self.home_page_scroll.scroll_to_bottom();
         }
     }
 
@@ -1143,6 +1200,7 @@ impl Hub {
                     let col = col.min(other_len - 1);
                     self.focus = Focus::Home(other, col);
                     self.home_scroll[other].scroll_to_item(col);
+                    self.scroll_home_to(other);
                 }
             }
             Pad::Confirm if row == 0 => {
@@ -1322,15 +1380,16 @@ impl Hub {
             .id("home")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.home_page_scroll)
             .bg(self.appearance.fill(0x0c1417))
             .flex()
             .flex_col()
             .child(hero)
             .child(div().h(px(1.)).bg(rgba((accent << 8) | 0x30)));
         if !recent.is_empty() {
-            page = page.child(row_title("Continue Playing", focused_name)).child(continue_row);
+            page = page.child(div().child(row_title("Continue Playing", focused_name)).child(continue_row));
         }
-        page.child(row_title("Systems", None)).child(systems_row)
+        page.child(div().child(row_title("Systems", None)).child(systems_row))
     }
 
     // ---- button hints -----------------------------------------------------
