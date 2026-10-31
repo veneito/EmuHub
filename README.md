@@ -1,3 +1,5 @@
+![EmuHub](assets/banner.png)
+
 # EmuHub
 
 A low-memory emulation hub for Windows, macOS and Linux/SteamOS, written in Rust with GPUI.
@@ -23,7 +25,7 @@ I wanted one app that sets up emulators like EmuDeck, shows my library like Play
 - Tells you when a new version is out (Settings → Download).
 
 **Playing**
-- RetroArch opens fullscreen; one game runs at a time. Intel Macs use the OpenGL driver with threaded video, which runs smoother there.
+- RetroArch opens fullscreen; one game runs at a time. Intel Macs use the OpenGL driver, which runs smoother there.
 - Share + Options (Select + Start) closes the game: RetroArch quits after saving, and Eden is asked to close.
 
 **Controller** (PlayStation or Xbox; the hints bar shows the right buttons)
@@ -38,7 +40,7 @@ Get the latest version from [Releases](https://github.com/veneito/EmuHub/release
 
 - **Windows:** `emuhub-windows.exe`.
 - **macOS:** `EmuHub.dmg` (universal: Apple Silicon and Intel). Drag EmuHub to Applications. It isn't notarized, so approve it once: right-click → Open (macOS 14 and older) or System Settings → Privacy & Security → Open Anyway (macOS 15+).
-- **Linux / SteamOS:** `emuhub-linux`. Run `chmod +x emuhub-linux` first. On Arch, install `libxkbcommon-x11 wayland vulkan-icd-loader fontconfig freetype2 alsa-lib` and your GPU's Vulkan driver. Add it to Steam as a non-Steam game to use it in Game Mode.
+- **Linux / SteamOS:** `EmuHub-x86_64.AppImage` (one file with an icon; Gear Lever or AppImageLauncher adds it to the app menu), or the bare `emuhub-linux`. Make it executable first (`chmod +x`). On Arch, install `libxkbcommon-x11 wayland vulkan-icd-loader fontconfig freetype2 alsa-lib` and your GPU's Vulkan driver. Add it to Steam as a non-Steam game to use it in Game Mode.
 
 EmuHub doesn't include games, BIOS files, keys or firmware. Use your own.
 

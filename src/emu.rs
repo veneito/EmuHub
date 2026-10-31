@@ -460,9 +460,9 @@ fn retroarch_overrides(roms_dir: &Path) -> String {
     // 4 is RetroArch's "Start + Select" combo.
     let mut text = String::from("input_quit_gamepad_combo = \"4\"\nquit_press_twice = \"false\"\n");
     // Intel Macs stutter on Vulkan (MoltenVK) and on RetroArch's Metal driver; glcore ran smoothly on a 2017 MacBook.
-    // Threaded video keeps their weak iGPUs from stalling emulation, at a frame of extra latency.
+    // Threaded video stays off: macOS OpenGL must draw on the main thread, and RetroArch crashed with it on.
     if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        text += "video_driver = \"glcore\"\nvideo_threaded = \"true\"\n";
+        text += "video_driver = \"glcore\"\nvideo_threaded = \"false\"\n";
     }
     let Some(emulation) = roms_dir.parent() else { return text };
     for (key, rel) in [

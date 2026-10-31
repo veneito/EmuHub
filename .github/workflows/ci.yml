@@ -64,7 +64,14 @@ jobs:
         run: |
           VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import json,sys; print(json.load(sys.stdin)['packages'][0]['version'])")
           APP=dmg/EmuHub.app
-          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          # Dock and Finder icon, every size macOS asks for.
+          mkdir emuhub.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s assets/emuhub.png --out emuhub.iconset/icon_${s}x${s}.png
+            sips -z $((s*2)) $((s*2)) assets/emuhub.png --out emuhub.iconset/icon_${s}x${s}@2x.png
+          done
+          iconutil -c icns emuhub.iconset -o "$APP/Contents/Resources/emuhub.icns"
           cp target/release/emuhub "$APP/Contents/MacOS/emuhub"
           cat > "$APP/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -74,6 +81,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>EmuHub</string>
             <key>CFBundleIdentifier</key><string>dev.emuhub.app</string>
             <key>CFBundleExecutable</key><string>emuhub</string>
+            <key>CFBundleIconFile</key><string>emuhub</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>$VERSION</string>
             <key>CFBundleVersion</key><string>$VERSION</string>
@@ -84,6 +92,24 @@ jobs:
           codesign --force --deep --sign - "$APP"
           ln -s /Applications dmg/Applications
           hdiutil create -volname EmuHub -srcfolder dmg -ov -format UDZO EmuHub.dmg
+
+      # One-file Linux app with icon and menu entry (what SteamOS/EmuDeck users expect).
+      - name: Package AppImage
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp target/release/emuhub AppDir/usr/bin/emuhub
+          cp assets/emuhub.desktop assets/emuhub.png AppDir/
+          ln -s usr/bin/emuhub AppDir/AppRun
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 ./appimagetool AppDir EmuHub-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: emuhub-AppImage
+          path: EmuHub-x86_64.AppImage
 
       - uses: actions/upload-artifact@v4
         with:
@@ -99,6 +125,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/release-notes.md
+          path: repo
       - uses: actions/download-artifact@v4
       - name: Publish release
         env:
@@ -107,4 +137,5 @@ jobs:
           mv emuhub-Windows/emuhub.exe emuhub-windows.exe
           mv emuhub-macOS/EmuHub.dmg EmuHub.dmg
           mv emuhub-Linux/emuhub emuhub-linux
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "EmuHub ${GITHUB_REF_NAME#v}" --generate-notes             emuhub-windows.exe EmuHub.dmg emuhub-linux
+          mv emuhub-AppImage/EmuHub-x86_64.AppImage EmuHub-x86_64.AppImage
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "EmuHub ${GITHUB_REF_NAME#v}" --notes-file repo/.github/release-notes.md --generate-notes --latest             emuhub-windows.exe EmuHub.dmg EmuHub-x86_64.AppImage emuhub-linux

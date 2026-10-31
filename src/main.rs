@@ -1387,7 +1387,7 @@ impl Hub {
                 .bg(rgba(0x00000040))
                 .child(div().w(px(180.)).h(px(270.)).rounded_lg().overflow_hidden().child(self.cover(hero_index.unwrap(), 180.)))
                 .into_any_element(),
-            None => tile("EmuHub", 280.).size_full().rounded_none().into_any_element(),
+            None => img("banner.png").size_full().object_fit(ObjectFit::Cover).into_any_element(),
         };
         let (title, facts) = match hero {
             Some(game) => (
@@ -1682,6 +1682,8 @@ fn main() {
                 window_background: WindowBackgroundAppearance::Transparent,
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(860.), px(560.))),
+                // Matches emuhub.desktop, so Linux taskbars show the AppImage's icon.
+                app_id: Some("emuhub".into()),
                 titlebar: Some(TitlebarOptions {
                     title: Some("EmuHub".into()),
                     appears_transparent: true,

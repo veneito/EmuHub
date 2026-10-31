@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=EmuHub
+Comment=Emulation hub: library, setup and controller navigation
+Exec=emuhub
+Icon=emuhub
+Categories=Game;Emulator;
+Terminal=false
