@@ -186,6 +186,29 @@ fn start(exe: &Path) -> Command {
 }
 
 /// Opens a web page in the default browser.
+/// Linux: adds EmuHub to the app menu (Hyprland/wofi/rofi, KDE, GNOME all read ~/.local/share/applications).
+/// Points at the AppImage when run from one, so moving the file and relaunching fixes the entry.
+pub fn add_to_app_menu() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Some(exe) = std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok()) else { return };
+    let data = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".local/share"));
+    let icon = data.join("icons/hicolor/512x512/apps/emuhub.png");
+    let desktop = data.join("applications/emuhub.desktop");
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=EmuHub\nComment=Emulation hub: library, setup and controller navigation\nExec=\"{}\"\nIcon={}\nCategories=Game;Emulator;\nTerminal=false\nStartupWMClass=emuhub\n",
+        exe.display(),
+        icon.display()
+    );
+    if !icon.exists() {
+        let _ = write_atomic(&icon, include_bytes!("../assets/emuhub.png"));
+    }
+    if std::fs::read_to_string(&desktop).ok().as_deref() != Some(entry.as_str()) {
+        let _ = write_atomic(&desktop, entry.as_bytes());
+    }
+}
+
 pub const RELEASES_URL: &str = "https://github.com/veneito/EmuHub/releases/latest";
 
 /// The latest release's version (like "0.2.0") if it's newer than this build. Reads only the tag name
@@ -535,6 +558,26 @@ pub fn retroarch_installed(cfg: &Config) -> bool {
     }
 }
 
+/// RetroArch 1.21.0 for Macs: 1.22.x lags everywhere (menus too) on Intel Macs; 1.21.0 runs smoothly.
+pub const RETROARCH_INTEL_MAC_URL: &str = "https://buildbot.libretro.com/stable/1.21.0/apple/osx/universal/";
+
+/// Intel Mac only: a warning when the installed RetroArch is a 1.22 release (read from its Info.plist).
+pub fn retroarch_version_warning(cfg: &Config) -> Option<String> {
+    if !cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        return None;
+    }
+    // .../RetroArch.app/Contents/MacOS/RetroArch → .../RetroArch.app/Contents/Info.plist
+    let plist = Path::new(cfg.retroarch_cmd.first()?).parent()?.parent()?.join("Info.plist");
+    let version = plist_version(&std::fs::read_to_string(plist).ok()?)?;
+    version.starts_with("1.22").then(|| format!("RetroArch {version} lags on Intel Macs. Install 1.21.0 over it (Download)."))
+}
+
+/// CFBundleShortVersionString from an XML Info.plist.
+fn plist_version(plist: &str) -> Option<String> {
+    let after = plist.split("<key>CFBundleShortVersionString</key>").nth(1)?;
+    Some(after.split("<string>").nth(1)?.split("</string>").next()?.trim().to_owned())
+}
+
 /// Starts RetroArch on its own, e.g. to change its settings.
 pub fn open_retroarch(cfg: &Config) -> Result<Running, String> {
     let child = retroarch(cfg)?.spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
@@ -572,7 +615,7 @@ pub fn install_retroarch() -> Result<(), String> {
         let missing = if cfg!(target_arch = "aarch64") {
             "Homebrew isn't installed. Get RetroArch from retroarch.com (drag it into Applications), or install Homebrew from brew.sh."
         } else {
-            "Get RetroArch from retroarch.com and drag it into Applications (Homebrew no longer supports Intel Macs)."
+            "Get RetroArch 1.21.0 from buildbot.libretro.com/stable/1.21.0/apple/osx/universal and drag it into Applications. Avoid 1.22, which lags on Intel Macs."
         };
         let brew = ["/usr/local/bin/brew", "/opt/homebrew/bin/brew"].into_iter().find(|p| Path::new(p).is_file()).ok_or(missing)?;
         (brew, &["install", "--cask", "retroarch"])
@@ -894,6 +937,16 @@ mod tests {
         let text = retroarch_overrides(&dir.join("roms"));
         assert!(text.contains("system_directory") && !text.contains("savefile_directory"));
         assert!(text.contains("input_quit_gamepad_combo = \"4\""));
+    }
+
+    #[test]
+    fn plist_version_is_read() {
+        let plist = "<dict>
+	<key>CFBundleShortVersionString</key>
+	<string>1.22.2</string>
+</dict>";
+        assert_eq!(plist_version(plist).as_deref(), Some("1.22.2"));
+        assert_eq!(plist_version("<dict></dict>"), None);
     }
 
     #[test]

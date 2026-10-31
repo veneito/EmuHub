@@ -804,6 +804,9 @@ impl Hub {
                 };
                 self.rescan(cx);
             }
+            Setting::RetroArch if emu::retroarch_version_warning(&self.config).is_some() => {
+                self.message = emu::open_url(emu::RETROARCH_INTEL_MAC_URL).err().unwrap_or_default();
+            }
             Setting::RetroArch if emu::retroarch_installed(&self.config) => {
                 if !self.game_running() {
                     match emu::open_retroarch(&self.config) {
@@ -1088,6 +1091,7 @@ impl Hub {
 
         let folders_exist = self.config.roms_dir.is_dir();
         let retroarch = emu::retroarch_installed(&self.config);
+        let retroarch_warning = emu::retroarch_version_warning(&self.config);
         let (missing, total) = emu::core_status(&self.config);
         let setup = card()
             .child(
@@ -1110,14 +1114,16 @@ impl Hub {
                 )),
             )
             .child(
-                if retroarch {
+                if let Some(warning) = &retroarch_warning {
+                    setting_row("RetroArch", warning)
+                } else if retroarch {
                     setting_row("RetroArch", "Installed. Open it to change its own settings.")
                 } else {
                     setting_row("RetroArch", "Not installed. Installs with winget, Homebrew or Flatpak.")
                 }
                 .child(self.setting_button(
                     Setting::RetroArch,
-                    Button::new("retroarch").label(if retroarch { "Open" } else { "Install" }).disabled(self.busy && !retroarch),
+                    Button::new("retroarch").label(if retroarch_warning.is_some() { "Download" } else if retroarch { "Open" } else { "Install" }).disabled(self.busy && !retroarch),
                     cx,
                 )),
             )
@@ -1672,6 +1678,7 @@ impl Render for Hub {
 }
 
 fn main() {
+    emu::add_to_app_menu();
     Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
