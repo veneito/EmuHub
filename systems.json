@@ -1,0 +1,16 @@
+[
+  { "id": "atari2600",   "name": "Atari 2600",       "exts": ["a26", "bin", "zip"],              "core": "stella",            "thumbs": "Atari - 2600" },
+  { "id": "nes",         "name": "NES",              "exts": ["nes", "zip"],                     "core": "mesen",             "thumbs": "Nintendo - Nintendo Entertainment System" },
+  { "id": "snes",        "name": "Super Nintendo",   "exts": ["sfc", "smc", "zip"],              "core": "snes9x",            "thumbs": "Nintendo - Super Nintendo Entertainment System" },
+  { "id": "n64",         "name": "Nintendo 64",      "exts": ["n64", "z64", "v64"],              "core": "mupen64plus_next",  "thumbs": "Nintendo - Nintendo 64" },
+  { "id": "gb",          "name": "Game Boy",         "exts": ["gb", "zip"],                      "core": "gambatte",          "thumbs": "Nintendo - Game Boy" },
+  { "id": "gbc",         "name": "Game Boy Color",   "exts": ["gbc", "zip"],                     "core": "gambatte",          "thumbs": "Nintendo - Game Boy Color" },
+  { "id": "gba",         "name": "Game Boy Advance", "exts": ["gba", "zip"],                     "core": "mgba",              "thumbs": "Nintendo - Game Boy Advance" },
+  { "id": "nds",         "name": "Nintendo DS",      "exts": ["nds", "zip"],                     "core": "melonds",           "thumbs": "Nintendo - Nintendo DS" },
+  { "id": "mastersystem","name": "Master System",    "exts": ["sms", "zip"],                     "core": "genesis_plus_gx",   "thumbs": "Sega - Master System - Mark III" },
+  { "id": "gamegear",    "name": "Game Gear",        "exts": ["gg", "zip"],                      "core": "genesis_plus_gx",   "thumbs": "Sega - Game Gear" },
+  { "id": "genesis",     "name": "Sega Genesis",     "exts": ["md", "gen", "bin", "zip"],        "core": "genesis_plus_gx",   "thumbs": "Sega - Mega Drive - Genesis" },
+  { "id": "segacd",      "name": "Sega CD",          "exts": ["cue", "chd", "m3u"],              "core": "genesis_plus_gx",   "thumbs": "Sega - Mega-CD - Sega CD" },
+  { "id": "pcengine",    "name": "TurboGrafx-16",    "exts": ["pce", "cue", "chd", "zip"],       "core": "mednafen_pce_fast", "thumbs": "NEC - PC Engine - TurboGrafx 16" },
+  { "id": "psx",         "name": "PlayStation",      "exts": ["cue", "chd", "pbp", "m3u"],       "core": "swanstation",       "thumbs": "Sony - PlayStation" }
+]
