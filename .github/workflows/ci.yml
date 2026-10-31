@@ -52,7 +52,35 @@ jobs:
             target/aarch64-apple-darwin/release/emuhub target/x86_64-apple-darwin/release/emuhub
           lipo -info target/release/emuhub
 
+      # EmuHub.app inside a drag-to-Applications .dmg. Signed ad hoc (free, not notarized),
+      # so the first open needs right-click → Open.
+      - name: Package EmuHub.dmg
+        if: runner.os == 'macOS'
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import json,sys; print(json.load(sys.stdin)['packages'][0]['version'])")
+          APP=dmg/EmuHub.app
+          mkdir -p "$APP/Contents/MacOS"
+          cp target/release/emuhub "$APP/Contents/MacOS/emuhub"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>EmuHub</string>
+            <key>CFBundleDisplayName</key><string>EmuHub</string>
+            <key>CFBundleIdentifier</key><string>dev.emuhub.app</string>
+            <key>CFBundleExecutable</key><string>emuhub</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>10.15</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          EOF
+          codesign --force --deep --sign - "$APP"
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname EmuHub -srcfolder dmg -ov -format UDZO EmuHub.dmg
+
       - uses: actions/upload-artifact@v4
         with:
           name: emuhub-${{ runner.os }}
-          path: target/release/${{ matrix.exe }}
+          path: ${{ runner.os == 'macOS' && 'EmuHub.dmg' || format('target/release/{0}', matrix.exe) }}
