@@ -54,6 +54,8 @@ enum MenuItem {
 /// The Settings buttons a controller can reach, top to bottom.
 #[derive(Clone, Copy, PartialEq)]
 enum Setting {
+    /// Choose where the Emulation folder lives.
+    EmulationFolder,
     RomFolders,
     RetroArch,
     Cores,
@@ -63,6 +65,8 @@ enum Setting {
     PickEmulator(usize),
     /// Open emu::EMULATORS[i]'s official site.
     EmulatorSite(usize),
+    /// Create and open Emulation/tools/<emulator>, to unzip it into.
+    EmulatorFolder(usize),
 }
 
 /// The game details window (right-click or Options). `focus` walks Play, Change cover, Close, then the cover choices.
@@ -86,9 +90,9 @@ const PALETTES: [(&str, u32, u32); 5] = [
 
 /// The Settings buttons a controller can reach, in on-screen order: Setup, Emulators, Appearance.
 fn settings_items() -> Vec<Setting> {
-    let mut items = vec![Setting::RomFolders, Setting::RetroArch, Setting::Cores];
+    let mut items = vec![Setting::EmulationFolder, Setting::RomFolders, Setting::RetroArch, Setting::Cores];
     for i in 0..emu::EMULATORS.len() {
-        items.extend([Setting::PickEmulator(i), Setting::EmulatorSite(i)]);
+        items.extend([Setting::EmulatorFolder(i), Setting::PickEmulator(i), Setting::EmulatorSite(i)]);
     }
     items.extend([Setting::Glass(false), Setting::Glass(true)]);
     items.extend((0..PALETTES.len()).map(Setting::Palette));
@@ -603,8 +607,34 @@ impl Hub {
     /// What each Settings button does, for both mouse clicks and the controller.
     fn apply_setting(&mut self, setting: Setting, window: &mut Window, cx: &mut Context<Self>) {
         match setting {
+            Setting::EmulationFolder => {
+                let picked = cx.prompt_for_paths(PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: Some("Choose where your Emulation folder goes".into()),
+                });
+                cx.spawn_in(window, async move |this, cx| {
+                    if let Ok(Ok(Some(mut paths))) = picked.await {
+                        let _ = this.update_in(cx, |view, window, cx| {
+                            view.config.roms_dir = emu::roms_dir_for(&paths.remove(0));
+                            let roms = view.config.roms_dir.display().to_string();
+                            view.roms_dir.update(cx, |input, cx| input.set_value(roms, window, cx));
+                            view.message = match emu::create_folders(&view.config).and_then(|()| view.config.save()) {
+                                Ok(()) => format!("Emulation folder: {}", emu::emulation_folder(&view.config).display()),
+                                Err(error) => error,
+                            };
+                            view.rescan(cx);
+                        });
+                    }
+                })
+                .detach();
+            }
             Setting::RomFolders if self.config.roms_dir.is_dir() => {
-                self.message = emu::open_folder(&self.config.roms_dir).err().unwrap_or_default();
+                self.message = emu::create_folders(&self.config)
+                    .and_then(|()| emu::open_folder(&self.config.roms_dir))
+                    .err()
+                    .unwrap_or_default();
             }
             Setting::RomFolders => {
                 self.message = match emu::create_folders(&self.config) {
@@ -649,6 +679,14 @@ impl Hub {
                     }
                 })
                 .detach();
+            }
+            Setting::EmulatorFolder(i) => {
+                let dir = emu::emulator_dir(&self.config, &emu::EMULATORS[i]);
+                self.message = std::fs::create_dir_all(&dir)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| emu::open_folder(&dir))
+                    .err()
+                    .unwrap_or_default();
             }
             Setting::EmulatorSite(i) => self.message = emu::open_url(emu::EMULATORS[i].site).err().unwrap_or_default(),
             Setting::Palette(i) => {
@@ -944,10 +982,17 @@ impl Hub {
         let (missing, total) = emu::core_status(&self.config);
         let setup = card()
             .child(
+                setting_row(
+                    "Emulation folder",
+                    &format!("{}. Holds roms, bios and tools. Pick an existing copy, or any folder to make a new one in.", emu::emulation_folder(&self.config).display()),
+                )
+                .child(self.setting_button(Setting::EmulationFolder, Button::new("emulation-folder").label("Choose…"), cx)),
+            )
+            .child(
                 if folders_exist {
-                    setting_row("ROM folders", "Put each game in its system's folder, then Rescan.")
+                    setting_row("ROM folders", "Put each game in its system's folder, then Rescan. Also adds any missing bios and tools folders.")
                 } else {
-                    setting_row("ROM folders", "Creates a folder for every supported system.")
+                    setting_row("ROM folders", "Creates EmuDeck's folders: one per system, plus bios and tools.")
                 }
                 .child(self.setting_button(
                     Setting::RomFolders,
@@ -989,13 +1034,14 @@ impl Hub {
                 self.systems.iter().filter(|s| s.standalone == emulator.id).map(|s| s.name.as_str()).collect();
             let note = match emu::find_emulator(&self.config, emulator) {
                 Some(path) => format!("Found: {}", path.display()),
-                None => format!("Not found. Install it from its website, then choose its program ({}).", if cfg!(target_os = "windows") { "eden.exe" } else { "eden" }),
+                None => format!("Not found. Unzip it into {}, or choose its program.", emu::emulator_dir(&self.config, emulator).display()),
             };
             emulators = emulators.child(
                 setting_row(&format!("{} ({})", emulator.name, systems.join(", ")), &note).child(
                     div()
                         .flex()
                         .gap_2()
+                        .child(self.setting_button(Setting::EmulatorFolder(i), Button::new(("emu-folder", i)).label("Open folder"), cx))
                         .child(self.setting_button(Setting::PickEmulator(i), Button::new(("pick-emu", i)).label("Choose…"), cx))
                         .child(self.setting_button(Setting::EmulatorSite(i), Button::new(("emu-site", i)).label("Website"), cx)),
                 ),

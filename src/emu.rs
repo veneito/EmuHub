@@ -101,11 +101,36 @@ impl Config {
     }
 }
 
+/// Creates EmuDeck's layout: roms/<system>, bios/, plus tools/<emulator> and bios/<emulator> for each
+/// standalone emulator. Safe to run again: existing folders and files are left alone.
 pub fn create_folders(cfg: &Config) -> Result<(), String> {
-    for s in systems() {
-        std::fs::create_dir_all(cfg.roms_dir.join(&s.id)).map_err(|e| e.to_string())?;
+    let emulation = emulation_dir(cfg);
+    let mut dirs: Vec<PathBuf> = systems().into_iter().map(|s| cfg.roms_dir.join(&s.id)).collect();
+    dirs.push(emulation.join("bios"));
+    for emu in &EMULATORS {
+        dirs.extend([emulator_dir(cfg, emu), emulation.join("bios").join(emu.id)]);
+    }
+    for dir in dirs {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
     }
     Ok(())
+}
+
+/// The roms folder for a folder picked as the Emulation folder. A folder named "Emulation" or one that
+/// already has roms/ is used as is (an existing EmuDeck copy); anything else gets an Emulation folder inside.
+pub fn roms_dir_for(picked: &Path) -> PathBuf {
+    let is_emulation = picked.file_name().is_some_and(|n| n.eq_ignore_ascii_case("emulation")) || picked.join("roms").is_dir();
+    if is_emulation { picked.join("roms") } else { picked.join("Emulation").join("roms") }
+}
+
+/// The Emulation folder (parent of roms/), shown in Settings.
+pub fn emulation_folder(cfg: &Config) -> PathBuf {
+    emulation_dir(cfg)
+}
+
+/// Where EmuHub looks for (and suggests unzipping) a standalone emulator: Emulation/tools/<id>.
+pub fn emulator_dir(cfg: &Config, emu: &Emulator) -> PathBuf {
+    emulation_dir(cfg).join("tools").join(emu.id)
 }
 
 /// Shows a folder in Explorer, Finder or the Linux file manager.
@@ -217,7 +242,7 @@ pub fn find_emulator(cfg: &Config, emu: &Emulator) -> Option<PathBuf> {
         return Some(picked.clone());
     }
     let exe = if cfg!(target_os = "windows") { format!("{}.exe", emu.exe) } else { emu.exe.to_owned() };
-    let mut places = vec![emulation_dir(cfg).join("tools").join(emu.id).join(&exe)];
+    let mut places = vec![emulator_dir(cfg, emu).join(&exe)];
     if cfg!(target_os = "windows") {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             places.push(PathBuf::from(local).join("Programs").join(emu.id).join(&exe));
@@ -759,6 +784,30 @@ mod tests {
         files.sort();
         assert_eq!(files, ["a.nca", "b.nca", "evil.nca"]);
         assert!(!root.join("eden/user/nand/system/Contents/evil.nca").exists());
+    }
+
+    #[test]
+    fn create_folders_builds_the_emudeck_layout_and_keeps_files() {
+        let root = std::env::temp_dir().join("emuhub_folders_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Emulation/bios/eden")).unwrap();
+        std::fs::write(root.join("Emulation/bios/eden/prod.keys"), b"keys").unwrap();
+        let cfg = Config { roms_dir: root.join("Emulation/roms"), ..default_config(&root) };
+        create_folders(&cfg).unwrap();
+        create_folders(&cfg).unwrap(); // running twice is fine
+        assert!(root.join("Emulation/roms/switch").is_dir());
+        assert!(root.join("Emulation/tools/eden").is_dir());
+        assert_eq!(std::fs::read(root.join("Emulation/bios/eden/prod.keys")).unwrap(), b"keys");
+    }
+
+    #[test]
+    fn picked_folders_become_an_emulation_folder() {
+        let root = std::env::temp_dir().join("emuhub_pick_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Backup/roms")).unwrap();
+        assert_eq!(roms_dir_for(&root.join("Backup")), root.join("Backup/roms")); // existing copy
+        assert_eq!(roms_dir_for(&root.join("Emulation")), root.join("Emulation/roms"));
+        assert_eq!(roms_dir_for(&root.join("Games")), root.join("Games/Emulation/roms")); // new install spot
     }
 
     #[test]
