@@ -61,8 +61,31 @@ pub fn config_dir() -> PathBuf {
     }
 }
 
+/// Places an existing EmuDeck "Emulation" folder usually lives: home, then every drive (D:\, a Mac's
+/// /Volumes/*, the Steam Deck's SD card under /run/media). Home first so a fresh setup stays there.
+fn emulation_candidates(home: &Path) -> Vec<PathBuf> {
+    let mut places = vec![home.to_path_buf()];
+    if cfg!(target_os = "windows") {
+        places.extend((b'C'..=b'Z').map(|d| PathBuf::from(format!("{}:\\", d as char))));
+    } else {
+        let subdirs = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect::<Vec<_>>();
+        places.extend(subdirs(Path::new("/Volumes")));
+        // SteamOS mounts the SD card at /run/media/<card> or /run/media/<user>/<card>.
+        for dir in subdirs(Path::new("/run/media")) {
+            places.extend(subdirs(&dir));
+            places.push(dir);
+        }
+    }
+    places
+}
+
+/// The roms folder of the first existing Emulation folder, or a new one in home.
+fn find_roms_dir(home: &Path, places: &[PathBuf]) -> PathBuf {
+    places.iter().map(|p| p.join("Emulation").join("roms")).find(|r| r.is_dir()).unwrap_or_else(|| home.join("Emulation").join("roms"))
+}
+
 fn default_config(home: &Path) -> Config {
-    let roms_dir = home.join("Emulation").join("roms");
+    let roms_dir = find_roms_dir(home, &emulation_candidates(home));
     let steamgriddb_key = String::new();
     if cfg!(target_os = "windows") {
         let ra = PathBuf::from(r"C:\RetroArch-Win64");
@@ -89,10 +112,18 @@ fn default_config(home: &Path) -> Config {
 
 impl Config {
     pub fn load() -> Self {
-        std::fs::read(config_dir().join("config.json"))
+        let mut cfg: Self = std::fs::read(config_dir().join("config.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_else(|| default_config(&home()))
+            .unwrap_or_else(|| default_config(&home()));
+        // A saved folder that's gone (an unplugged drive, the old default) gives way to one that exists.
+        if !cfg.roms_dir.is_dir() {
+            let found = find_roms_dir(&home(), &emulation_candidates(&home()));
+            if found.is_dir() {
+                cfg.roms_dir = found;
+            }
+        }
+        cfg
     }
     pub fn save(&self) -> Result<(), String> {
         let dir = config_dir();
@@ -412,10 +443,10 @@ fn retroarch_overrides(roms_dir: &Path) -> String {
     // Share+Options (Select+Start) quits right away; RetroArch then writes saves before closing.
     // 4 is RetroArch's "Start + Select" combo.
     let mut text = String::from("input_quit_gamepad_combo = \"4\"\nquit_press_twice = \"false\"\n");
-    // Intel Macs run RetroArch's native Metal driver better than Vulkan (which goes through MoltenVK there).
+    // Intel Macs stutter on Vulkan (MoltenVK) and on RetroArch's Metal driver; glcore ran smoothly on a 2017 MacBook.
+    // Threaded video keeps their weak iGPUs from stalling emulation, at a frame of extra latency.
     if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        text += "video_driver = \"metal\"
-";
+        text += "video_driver = \"glcore\"\nvideo_threaded = \"true\"\n";
     }
     let Some(emulation) = roms_dir.parent() else { return text };
     for (key, rel) in [
@@ -686,7 +717,7 @@ pub fn fetch_cover(game: &Game, steamgriddb_key: &str) -> bool {
         }
     }
     match bytes {
-        Some(bytes) => write_atomic(&default_cover(game), &bytes).is_ok(),
+        Some(bytes) => write_atomic(&default_cover(game), &shrink_cover(&bytes)).is_ok(),
         None => {
             let _ = write_atomic(&miss, b"");
             false
@@ -736,11 +767,41 @@ pub fn cover_candidates(game: &Game, steamgriddb_key: &str) -> Vec<Candidate> {
 }
 
 /// Downloads the chosen cover and makes it the game's cover.
+/// Covers are drawn at most ~240px wide, so 360px stays sharp on high-DPI screens. libretro's
+/// full-size box art is 5-10x bigger, which made every scroll decode megabytes per card.
+const COVER_WIDTH: u32 = 360;
+
+/// The image scaled down to COVER_WIDTH as PNG, or the original bytes if it's small or not an image.
+fn shrink_cover(bytes: &[u8]) -> Vec<u8> {
+    let Ok(img) = image::load_from_memory(bytes) else { return bytes.to_vec() };
+    if img.width() <= COVER_WIDTH {
+        return bytes.to_vec();
+    }
+    let small = img.resize(COVER_WIDTH, u32::MAX, image::imageops::FilterType::Triangle);
+    let mut out = std::io::Cursor::new(Vec::new());
+    match small.write_to(&mut out, image::ImageFormat::Png) {
+        Ok(()) => out.into_inner(),
+        Err(_) => bytes.to_vec(),
+    }
+}
+
+/// Shrinks a cover saved by an older EmuHub in place. Cheap when it's already small (size check only).
+pub fn shrink_cached_cover(path: &Path) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > 150_000) {
+        if let Ok(bytes) = std::fs::read(path) {
+            let small = shrink_cover(&bytes);
+            if small.len() < bytes.len() {
+                let _ = write_atomic(path, &small);
+            }
+        }
+    }
+}
+
 pub fn set_cover(game: &Game, url: &str) -> Result<(), String> {
     let bytes = download(url, None)?;
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     let file = format!("{}.{stamp}.png", thumb_name(&game.name));
-    write_atomic(&cover_dir(game).join(&file), &bytes)?;
+    write_atomic(&cover_dir(game).join(&file), &shrink_cover(&bytes))?;
     write_atomic(&default_cover(game).with_extension("cover"), file.as_bytes())
 }
 
@@ -815,6 +876,26 @@ mod tests {
         let text = retroarch_overrides(&dir.join("roms"));
         assert!(text.contains("system_directory") && !text.contains("savefile_directory"));
         assert!(text.contains("input_quit_gamepad_combo = \"4\""));
+    }
+
+    #[test]
+    fn big_covers_are_shrunk() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(800, 1200).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let small = image::load_from_memory(&shrink_cover(png.get_ref())).unwrap();
+        assert_eq!((small.width(), small.height()), (360, 540));
+        assert_eq!(shrink_cover(b"not an image"), b"not an image");
+    }
+
+    #[test]
+    fn existing_emulation_folder_is_found() {
+        let root = std::env::temp_dir().join("emuhub_find_test");
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, drive) = (root.join("home"), root.join("D"));
+        std::fs::create_dir_all(drive.join("Emulation/roms")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(find_roms_dir(&home, &[home.clone(), drive.clone()]), drive.join("Emulation/roms"));
+        assert_eq!(find_roms_dir(&home, &[home.clone()]), home.join("Emulation/roms"));
     }
 
     #[test]

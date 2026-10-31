@@ -1499,6 +1499,7 @@ dependencies = [
  "gilrs",
  "gpui",
  "gpui-component",
+ "image",
  "serde",
  "serde_json",
  "ureq",

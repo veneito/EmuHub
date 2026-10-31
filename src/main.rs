@@ -69,7 +69,7 @@ enum Setting {
     EmulatorFolder(usize),
 }
 
-/// The game details window (right-click or Options). `focus` walks Play, Change cover, Close, then the cover choices.
+/// The full-screen game page (right-click or Options). `focus` walks Play, Change cover, Back, then the cover choices.
 struct Details {
     game: usize,
     /// None until "Change cover" is pressed; then the downloaded choices.
@@ -81,7 +81,7 @@ struct Details {
 }
 
 const DETAIL_BUTTONS: usize = 3;
-/// Cover choices per row: the 820px panel minus padding fits six 110px tiles with 16px gaps.
+/// Cover choices per row: the 740px choices box fits six 110px tiles with 16px gaps.
 const CHOICE_COLUMNS: usize = 6;
 
 const PALETTES: [(&str, u32, u32); 5] = [
@@ -235,6 +235,19 @@ impl Hub {
         let cores_dir = field(config.cores_dir.display().to_string());
         // Hidden like a password, with an eye button to show it while typing.
         let steamgriddb_key = cx.new(|cx| InputState::new(window, cx).masked(true).default_value(config.steamgriddb_key.clone()));
+        // Saved as it's typed or pasted, so it doesn't depend on finding the Save button.
+        cx.subscribe_in(&steamgriddb_key, window, |view, input, event, _, cx| {
+            if let InputEvent::Change = event {
+                view.config.steamgriddb_key = input.read(cx).value().trim().to_owned();
+                view.message = match view.config.save() {
+                    Ok(()) if view.config.steamgriddb_key.is_empty() => "API key removed.".into(),
+                    Ok(()) => "API key saved.".into(),
+                    Err(error) => format!("Could not save API key: {error}"),
+                };
+                cx.notify();
+            }
+        })
+        .detach();
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search games"));
         cx.subscribe_in(&query, window, |view, _, event, _, cx| match event {
             InputEvent::PressEnter { .. } => {
@@ -334,38 +347,41 @@ impl Hub {
         let missing: Vec<(usize, Game)> =
             self.games.iter().enumerate().filter(|(i, _)| self.covers[*i].is_none()).map(|(i, g)| (i, g.clone())).collect();
         let recent: Vec<Game> = self.recent().into_iter().map(|i| self.games[i].clone()).collect();
+        let cached: Vec<std::path::PathBuf> = self.covers.iter().flatten().cloned().collect();
         let key = self.config.steamgriddb_key.clone();
         cx.spawn(async move |this, cx| {
-            let mut since_redraw = 0;
-            let count = missing.len();
-            for (n, (index, game)) in missing.into_iter().enumerate() {
-                let key = key.clone();
-                let path = game.path.clone();
-                let got = cx.background_executor().spawn(async move { emu::fetch_cover(&game, &key).then(|| emu::cover_path(&game)) }).await;
-                let Some(cover) = got else { continue };
-                since_redraw += 1;
-                // Redraw every 12 covers (and at the end) instead of after each one.
-                let redraw = since_redraw >= 12 || n + 1 == count;
+            // 8 downloads at a time, redrawing once per batch.
+            for batch in missing.chunks(8) {
+                let tasks: Vec<_> = batch
+                    .iter()
+                    .cloned()
+                    .map(|(index, game)| {
+                        let key = key.clone();
+                        cx.background_executor().spawn(async move { (index, game.path.clone(), emu::fetch_cover(&game, &key).then(|| emu::cover_path(&game))) })
+                    })
+                    .collect();
+                let mut got = vec![];
+                for task in tasks {
+                    got.push(task.await);
+                }
                 let alive = this.update(cx, |view, cx| {
                     if view.cover_pass != pass {
                         return false;
                     }
-                    if view.games.get(index).is_some_and(|g| g.path == path) {
-                        view.covers[index] = Some(cover);
+                    for (index, path, cover) in got {
+                        if let Some(cover) = cover.filter(|_| view.games.get(index).is_some_and(|g| g.path == path)) {
+                            view.covers[index] = Some(cover);
+                        }
                     }
-                    if redraw {
-                        cx.notify();
-                    }
+                    cx.notify();
                     true
                 });
                 if !alive.unwrap_or(false) {
                     return;
                 }
-                if redraw {
-                    since_redraw = 0;
-                }
             }
-            let _ = this.update(cx, |_, cx| cx.notify());
+            // One-time cleanup of full-size covers from older versions; already-small ones are skipped by size.
+            cx.background_executor().spawn(async move { cached.iter().for_each(|p| emu::shrink_cached_cover(p)) }).await;
             for game in recent {
                 let got = cx.background_executor().spawn(async move { emu::fetch_snap(&game) }).await;
                 if got && this.update(cx, |_, cx| cx.notify()).is_err() {
@@ -534,7 +550,7 @@ impl Hub {
         cx.notify();
     }
 
-    /// Controller in the details window: any direction steps through the buttons and cover choices.
+    /// Controller on the game page: any direction steps through the buttons and cover choices.
     fn details_pad(&mut self, action: Pad, cx: &mut Context<Self>) {
         let Some(details) = &mut self.details else { return };
         let count = DETAIL_BUTTONS + details.candidates.as_ref().map_or(0, Vec::len);
@@ -561,7 +577,7 @@ impl Hub {
         }
     }
 
-    /// 0 = Play, 1 = Change cover, 2 = Close, 3.. = pick that cover.
+    /// 0 = Play, 1 = Change cover, 2 = Back, 3.. = pick that cover.
     fn details_action(&mut self, item: usize, cx: &mut Context<Self>) {
         let Some(details) = &mut self.details else { return };
         let game = self.games[details.game].clone();
@@ -607,37 +623,47 @@ impl Hub {
             tile(&game.name, 160.).size_full().rounded_none().into_any_element()
         };
         let focused = |i: usize| details.focus == i;
-        let mut buttons = div().flex().gap_2().pt_2();
-        for (i, (id, label)) in [("detail-play", "Play"), ("detail-cover", "Change cover"), ("detail-close", "Close")].into_iter().enumerate() {
-            let mut button = Button::new(id).label(label);
-            if i == 0 {
-                button = button.primary();
-            }
+        // Round icon buttons with a label underneath; Play is filled with the accent color.
+        let mut buttons = div().flex().gap_6().pt_4();
+        for (i, (id, name, label)) in
+            [("detail-play", "play", "Play"), ("detail-cover", "image", "Change cover"), ("detail-close", "arrow-left", "Back")].into_iter().enumerate()
+        {
+            let (bg, fg) = if i == 0 { (rgb(self.appearance.accent), rgb(0x0c1417)) } else { (rgba(0xffffff1a), rgb(TEXT)) };
+            let circle = self
+                .ring(div().w(px(64.)).h(px(64.)).rounded_full().flex().items_center().justify_center().bg(bg), focused(i))
+                .child(icon(name, 26., fg));
             buttons = buttons.child(
-                self.ring(div().rounded_md(), focused(i))
-                    .child(button.disabled(i == 1 && details.loading).on_click(cx.listener(move |view, _, _, cx| view.details_action(i, cx)))),
+                div()
+                    .id(id)
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .when(i == 1 && details.loading, |d| d.opacity(0.5))
+                    .hover(|style| style.opacity(0.85))
+                    .on_click(cx.listener(move |view, _, _, cx| view.details_action(i, cx)))
+                    .child(circle)
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(label)),
             );
         }
+        let played = self.history.get(&game.path).map(|&t| format!("Last played {}", emu::ago(t)));
 
         let mut panel = div()
             .id("details-panel")
-            .w(px(820.))
-            .max_h(px(640.))
+            .size_full()
             .overflow_y_scroll()
-            .p_6()
+            .px_12()
+            .py_10()
             .flex()
             .flex_col()
-            .gap_5()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgba(0xffffff14))
-            // Always solid, even in Glass mode, so the library doesn't show through the text.
-            .bg(appearance::Appearance { glass: false, ..self.appearance }.fill(0x101e23))
+            .gap_6()
             .child(
                 div()
                     .flex()
-                    .gap_6()
-                    .child(div().w(px(160.)).h(px(240.)).flex_none().rounded_lg().overflow_hidden().child(art))
+                    .items_end()
+                    .gap_10()
+                    .child(div().w(px(240.)).h(px(360.)).flex_none().rounded_lg().overflow_hidden().shadow_lg().child(art))
                     .child(
                         div()
                             .flex_1()
@@ -646,7 +672,8 @@ impl Hub {
                             .flex_col()
                             .gap_2()
                             .child(heading(system_name(&self.systems, &game.system)))
-                            .child(div().text_size(px(26.)).font_weight(FontWeight::SEMIBOLD).child(game.name.clone()))
+                            .child(div().text_size(px(40.)).font_weight(FontWeight::SEMIBOLD).child(game.name.clone()))
+                            .children(played.map(|p| div().flex().items_center().gap_2().text_color(rgb(MUTED)).child(icon("history", 16., rgb(MUTED))).child(p)))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(game.path.display().to_string()))
                             .child(buttons),
                     ),
@@ -657,6 +684,7 @@ impl Hub {
         } else if let Some(candidates) = &details.candidates {
             let mut choices = div()
                 .id("cover-choices")
+                .w(px(740.))
                 .max_h(px(290.))
                 .overflow_y_scroll()
                 .track_scroll(&details.scroll)
@@ -688,18 +716,18 @@ impl Hub {
             });
         }
 
-        // Full-window backdrop that blocks clicks to the library underneath.
+        // Full page between the title bar and the hints bar, over a dimmed copy of the cover.
+        let cover = emu::cover_path(game);
         div()
             .id("details")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .occlude()
-            .bg(rgba(0x000000b0))
-            .flex()
-            .items_center()
-            .justify_center()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(appearance::Appearance { glass: false, ..self.appearance }.fill(0x101e23))
+            .when(cover.exists(), |d| {
+                d.child(div().absolute().top_0().left_0().size_full().opacity(0.12).child(img(cover).size_full().object_fit(ObjectFit::Cover)))
+            })
             .child(panel)
     }
 
@@ -1470,7 +1498,7 @@ impl Hub {
     /// What the controller buttons do right now, shown in the bottom bar.
     fn hints(&self) -> Vec<(Hint, &'static str)> {
         if self.details.is_some() {
-            return vec![(Hint::Confirm, "Select"), (Hint::Back, "Close")];
+            return vec![(Hint::Confirm, "Select"), (Hint::Back, "Back")];
         }
         match self.focus {
             Focus::Menu(_) => vec![(Hint::Confirm, "Open"), (Hint::Bumpers, "Switch system")],
@@ -1606,9 +1634,11 @@ impl Render for Hub {
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("EmuHub")),
                 ),
             )
-            .child(body)
+            .child(match &self.details {
+                Some(d) => self.details_window(d, cx).into_any_element(),
+                None => body.into_any_element(),
+            })
             .child(self.bottom_bar())
-            .children(self.details.as_ref().map(|d| self.details_window(d, cx)))
     }
 }
 

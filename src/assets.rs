@@ -17,6 +17,8 @@ const ICONS: &[(&str, &str)] = &[
     ("sidebar", r#"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>"#),
     ("folder", r#"<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>"#),
     ("terminal", r#"<path d="m5 8 5 4-5 4M12 17h7"/>"#),
+    ("image", r#"<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5-9 9"/>"#),
+    ("arrow-left", r#"<path d="M19 12H5m6-6-6 6 6 6"/>"#),
     ("refresh", r#"<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>"#),
     // Controller button glyphs for the hints bar.
     ("btn-cross", r#"<path d="m7 7 10 10M17 7 7 17"/>"#),
