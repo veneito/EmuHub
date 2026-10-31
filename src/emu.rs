@@ -331,7 +331,11 @@ pub struct Emulator {
     args: &'static [&'static str],
 }
 
-pub const EMULATORS: [Emulator; 1] = [Emulator { id: "eden", name: "Eden", site: "https://eden-emu.dev", exe: "eden", args: &["-f", "-g"] }];
+pub const EMULATORS: [Emulator; 3] = [
+    Emulator { id: "eden", name: "Eden", site: "https://eden-emu.dev", exe: "eden", args: &["-f", "-g"] },
+    Emulator { id: "pcsx2", name: "PCSX2", site: "https://pcsx2.net", exe: "pcsx2-qt", args: &["-batch", "-fullscreen", "--"] },
+    Emulator { id: "dolphin", name: "Dolphin", site: "https://dolphin-emu.org", exe: "Dolphin", args: &["-b", "-e"] },
+];
 
 pub fn emulator(id: &str) -> Option<&'static Emulator> {
     EMULATORS.iter().find(|e| e.id == id)
@@ -354,12 +358,14 @@ pub fn find_emulator(cfg: &Config, emu: &Emulator) -> Option<PathBuf> {
             places.push(PathBuf::from(local).join("Programs").join(emu.id).join(&exe));
         }
     } else if cfg!(target_os = "macos") {
-        places.push(PathBuf::from(format!("/Applications/{}.app/Contents/MacOS/{}", emu.name, emu.exe)));
+        // The program inside the bundle isn't always named like the Windows exe (PCSX2.app has "PCSX2").
+        let macos = PathBuf::from(format!("/Applications/{}.app/Contents/MacOS", emu.name));
+        places.extend(std::fs::read_dir(macos).into_iter().flatten().flatten().map(|e| e.path()));
     } else if let Ok(entries) = std::fs::read_dir(home().join("Applications")) {
         // EmuDeck keeps AppImages like ~/Applications/Eden-x86_64.AppImage.
         places.extend(entries.flatten().map(|e| e.path()).filter(|p| {
             let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-            name.starts_with(emu.exe) && name.ends_with(".appimage")
+            name.starts_with(emu.id) && name.ends_with(".appimage")
         }));
     }
     if let Some(path) = std::env::var_os("PATH") {
@@ -449,6 +455,15 @@ fn record_play(game: &Game) {
     history.insert(game.path.clone(), now());
     // Best effort: a failed write only loses the "Continue Playing" order.
     let _ = write_atomic(&config_dir().join("history.json"), &serde_json::to_vec(&history).unwrap());
+}
+
+/// Favorite games, by file path.
+pub fn load_favorites() -> std::collections::HashSet<PathBuf> {
+    std::fs::read(config_dir().join("favorites.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+pub fn save_favorites(favorites: &std::collections::HashSet<PathBuf>) -> Result<(), String> {
+    write_atomic(&config_dir().join("favorites.json"), &serde_json::to_vec(favorites).unwrap())
 }
 
 /// "35 seconds ago", "5 days ago".

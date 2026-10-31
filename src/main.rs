@@ -22,16 +22,18 @@ const FONT: &str = if cfg!(target_os = "windows") { "Segoe UI" } else { ".System
 enum View {
     Home,
     Library,
-    Settings,
 }
 
-/// Where the controller is, RetroArch style: the side menu, the game grid, or a Settings button.
+/// Where the controller is, RetroArch style: the side menu, the game grid, or the Settings popup.
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
     Menu(usize),
     Grid,
+    /// A category in the Settings popup's list.
+    SettingsCat(usize),
+    /// A Settings button, by index into settings_items().
     Settings(usize),
-    /// Home page: (row, column). Row 0 is Continue Playing, row 1 is Systems.
+    /// Home page: (row, column). Rows: 0 Continue Playing, 1 Favorites, 2 Systems.
     Home(usize, usize),
 }
 
@@ -72,7 +74,7 @@ enum Setting {
     Update,
 }
 
-/// The full-screen game page (right-click or Options). `focus` walks Play, Change cover, Back, then the cover choices.
+/// The full-screen game page (right-click or Options). `focus` walks Play, Favorite, Change cover, Back, then the cover choices.
 struct Details {
     game: usize,
     /// None until "Change cover" is pressed; then the downloaded choices.
@@ -83,7 +85,9 @@ struct Details {
     scroll: ScrollHandle,
 }
 
-const DETAIL_BUTTONS: usize = 3;
+const DETAIL_BUTTONS: usize = 4;
+/// Width of the All Games side panel.
+const PANEL_WIDTH: f32 = 300.;
 /// Cover choices per row: the 740px choices box fits six 110px tiles with 16px gaps.
 const CHOICE_COLUMNS: usize = 6;
 
@@ -94,6 +98,23 @@ const PALETTES: [(&str, u32, u32); 5] = [
     ("Plum", 0x211324, 0xd5a8e3),
     ("Forest", 0x101f19, 0x91cba6),
 ];
+
+/// The Settings popup's categories; Paths needs a keyboard, so it has no controller buttons.
+const SETTING_CATEGORIES: [&str; 4] = ["Setup", "Emulators", "Appearance", "Paths"];
+
+/// (category, row in that category's card) of a Settings button.
+fn setting_place(setting: Setting) -> (usize, usize) {
+    match setting {
+        Setting::EmulationFolder => (0, 0),
+        Setting::RomFolders => (0, 1),
+        Setting::RetroArch => (0, 2),
+        Setting::Cores => (0, 3),
+        Setting::EmulatorFolder(i) | Setting::PickEmulator(i) | Setting::EmulatorSite(i) => (1, i),
+        Setting::Glass(_) => (2, 0),
+        Setting::Palette(_) => (2, 1),
+        Setting::Update => (2, 2),
+    }
+}
 
 /// The Settings buttons a controller can reach, in on-screen order: Setup, Emulators, Appearance.
 fn settings_items() -> Vec<Setting> {
@@ -125,6 +146,9 @@ struct Hub {
     systems: Vec<System>,
     games: Vec<Game>,
     view: View,
+    /// The Settings popup is open, showing SETTING_CATEGORIES[settings_cat].
+    settings_open: bool,
+    settings_cat: usize,
     system: Option<String>,
     selected: Option<usize>,
     sidebar_open: bool,
@@ -148,12 +172,13 @@ struct Hub {
     /// Bumped on every rescan so an older cover download pass stops.
     cover_pass: usize,
     /// Horizontal scroll of the Home rows, so the controller's card stays in view.
-    home_scroll: [ScrollHandle; 2],
-    /// Vertical scroll of the Home and Settings pages, so the controller's section stays in view.
+    home_scroll: [ScrollHandle; 3],
+    /// Vertical scroll of the Home page and the Settings popup's card, so the controller's item stays in view.
     home_page_scroll: ScrollHandle,
     settings_scroll: ScrollHandle,
     /// When each game was last played, for Continue Playing.
     history: std::collections::HashMap<std::path::PathBuf, u64>,
+    favorites: std::collections::HashSet<std::path::PathBuf>,
     message: String,
     /// A newer release, once the startup check finds one, and the top-right popup's state.
     update: Option<update::Release>,
@@ -300,6 +325,8 @@ impl Hub {
             games: vec![],
             config,
             view: View::Home,
+            settings_open: false,
+            settings_cat: 0,
             system: None,
             selected: None,
             sidebar_open: true,
@@ -314,10 +341,11 @@ impl Hub {
             visible_cache: vec![],
             covers: vec![],
             cover_pass: 0,
-            home_scroll: [ScrollHandle::new(), ScrollHandle::new()],
+            home_scroll: [ScrollHandle::new(), ScrollHandle::new(), ScrollHandle::new()],
             home_page_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
             history: emu::load_history(),
+            favorites: emu::load_favorites(),
             message: String::new(),
             update: None,
             update_state: UpdateState::Hidden,
@@ -479,8 +507,8 @@ impl Hub {
     /// The menu entry for the page on screen.
     fn current_menu(&self) -> usize {
         let here = match self.view {
+            _ if self.settings_open => MenuItem::Settings,
             View::Home => MenuItem::Home,
-            View::Settings => MenuItem::Settings,
             View::Library => MenuItem::Library(self.system.clone()),
         };
         self.menu().iter().position(|m| *m == here).unwrap_or(0)
@@ -489,7 +517,7 @@ impl Hub {
     fn show(&mut self, item: &MenuItem) {
         match item {
             MenuItem::Home => self.view = View::Home,
-            MenuItem::Settings => self.view = View::Settings,
+            MenuItem::Settings => self.settings_open = true,
             MenuItem::Library(system) => {
                 if self.view != View::Library || self.system != *system {
                     self.selected = None;
@@ -522,6 +550,7 @@ impl Hub {
         let menu = self.menu();
         match (self.focus, action) {
             (_, Pad::CloseGame) => {} // handled above
+            (Focus::Settings(_) | Focus::SettingsCat(_), Pad::PrevTab | Pad::NextTab) => {} // not behind the Settings popup
             (_, Pad::PrevTab | Pad::NextTab) => {
                 let tabs = menu.len() - 1; // Settings isn't a tab
                 let at = self.current_menu().min(tabs - 1);
@@ -529,17 +558,18 @@ impl Hub {
                 self.show(&menu[next]);
                 self.focus = Focus::Menu(next);
             }
-            // Side menu: up/down previews each page, X or Right goes into it.
+            // Side menu: up/down previews each page (but only X opens the Settings popup), X or Right goes into it.
             (Focus::Menu(i), Pad::Up | Pad::Down) => {
                 let i = if action == Pad::Up { i.saturating_sub(1) } else { (i + 1).min(menu.len() - 1) };
-                self.show(&menu[i]);
+                if menu[i] != MenuItem::Settings {
+                    self.show(&menu[i]);
+                }
                 self.focus = Focus::Menu(i);
             }
             (Focus::Menu(i), Pad::Confirm | Pad::Right) => {
                 self.show(&menu[i]);
                 if menu[i] == MenuItem::Settings {
-                    self.focus = Focus::Settings(0);
-                    self.scroll_settings_to(0);
+                    self.focus = Focus::SettingsCat(self.settings_cat);
                 } else if menu[i] == MenuItem::Home {
                     self.enter_home();
                 } else if !self.visible(cx).is_empty() {
@@ -567,12 +597,34 @@ impl Hub {
             (Focus::Grid, Pad::Right) => self.move_selection(1, cx),
             (Focus::Grid, Pad::Up) => self.move_selection(-(self.columns as isize), cx),
             (Focus::Grid, Pad::Down) => self.move_selection(self.columns as isize, cx),
-            // Settings: up/down through the buttons, X presses, O or Left returns to the menu.
-            (Focus::Settings(_), Pad::Back | Pad::Left) => self.focus = Focus::Menu(self.current_menu()),
+            // Settings popup: up/down picks a category, X or Right goes into its buttons, O closes.
+            (Focus::SettingsCat(_), Pad::Back | Pad::Left) => self.close_settings(),
+            (Focus::SettingsCat(c), Pad::Up | Pad::Down) => {
+                let c = if action == Pad::Up { c.saturating_sub(1) } else { (c + 1).min(SETTING_CATEGORIES.len() - 1) };
+                self.settings_cat = c;
+                self.focus = Focus::SettingsCat(c);
+                self.settings_scroll.scroll_to_item(0);
+            }
+            (Focus::SettingsCat(c), Pad::Confirm | Pad::Right) => {
+                if let Some(j) = settings_items().iter().position(|&s| setting_place(s).0 == c) {
+                    self.focus = Focus::Settings(j);
+                }
+            }
+            (Focus::SettingsCat(_), Pad::Options) => {}
+            // Settings buttons: up/down within the category, X presses, O or Left back to the categories.
+            (Focus::Settings(j), Pad::Back | Pad::Left) => self.focus = Focus::SettingsCat(setting_place(settings_items()[j]).0),
             (Focus::Settings(j), Pad::Up | Pad::Down) => {
-                let j = if action == Pad::Up { j.saturating_sub(1) } else { (j + 1).min(settings_items().len() - 1) };
-                self.focus = Focus::Settings(j);
-                self.scroll_settings_to(j);
+                let items = settings_items();
+                let cat = setting_place(items[j]).0;
+                let next = if action == Pad::Up {
+                    (0..j).rev().find(|&k| setting_place(items[k]).0 == cat)
+                } else {
+                    (j + 1..items.len()).find(|&k| setting_place(items[k]).0 == cat)
+                };
+                if let Some(k) = next {
+                    self.focus = Focus::Settings(k);
+                    self.settings_scroll.scroll_to_item(setting_place(items[k]).1);
+                }
             }
             (Focus::Settings(j), Pad::Confirm) => self.apply_setting(settings_items()[j], window, cx),
             (Focus::Settings(_), Pad::Right | Pad::Options) => {}
@@ -591,7 +643,7 @@ impl Hub {
         let Some(details) = &mut self.details else { return };
         let count = DETAIL_BUTTONS + details.candidates.as_ref().map_or(0, Vec::len);
         let focus = details.focus;
-        // Buttons are 0..3 in one row; covers follow in rows of CHOICE_COLUMNS.
+        // Buttons are 0..4 in one row; covers follow in rows of CHOICE_COLUMNS.
         let next = match action {
             Pad::Back | Pad::Options => {
                 self.details = None;
@@ -602,7 +654,7 @@ impl Hub {
             Pad::Left => focus.saturating_sub(1),
             Pad::Right => (focus + 1).min(count - 1),
             Pad::Up if focus < DETAIL_BUTTONS => focus,
-            Pad::Up if focus < DETAIL_BUTTONS + CHOICE_COLUMNS => 1, // first row of covers → Change cover
+            Pad::Up if focus < DETAIL_BUTTONS + CHOICE_COLUMNS => 2, // first row of covers → Change cover
             Pad::Up => focus - CHOICE_COLUMNS,
             Pad::Down if focus < DETAIL_BUTTONS => DETAIL_BUTTONS.min(count - 1),
             Pad::Down => (focus + CHOICE_COLUMNS).min(count - 1),
@@ -613,7 +665,7 @@ impl Hub {
         }
     }
 
-    /// 0 = Play, 1 = Change cover, 2 = Back, 3.. = pick that cover.
+    /// 0 = Play, 1 = Favorite, 2 = Change cover, 3 = Back, 4.. = pick that cover.
     fn details_action(&mut self, item: usize, cx: &mut Context<Self>) {
         let Some(details) = &mut self.details else { return };
         let game = self.games[details.game].clone();
@@ -623,7 +675,11 @@ impl Hub {
                 self.details = None;
                 self.play(index, cx);
             }
-            1 if !details.loading => {
+            1 => {
+                let index = details.game;
+                self.toggle_favorite(index);
+            }
+            2 if !details.loading => {
                 details.loading = true;
                 details.candidates = None;
                 let key = self.config.steamgriddb_key.clone();
@@ -639,8 +695,8 @@ impl Hub {
                 })
                 .detach();
             }
-            1 => {}
-            2 => self.details = None,
+            2 => {}
+            3 => self.details = None,
             n => {
                 let Some(choice) = details.candidates.as_ref().and_then(|c| c.get(n - DETAIL_BUTTONS)) else { return };
                 let url = choice.url.clone();
@@ -661,8 +717,16 @@ impl Hub {
         let focused = |i: usize| details.focus == i;
         // Round icon buttons with a label underneath; Play is filled with the accent color.
         let mut buttons = div().flex().gap_6().pt_4();
-        for (i, (id, name, label)) in
-            [("detail-play", "play", "Play"), ("detail-cover", "image", "Change cover"), ("detail-close", "arrow-left", "Back")].into_iter().enumerate()
+        let favorite = self.favorites.contains(&game.path);
+        let (heart, heart_label) = if favorite { ("heart-filled", "Unfavorite") } else { ("heart", "Favorite") };
+        for (i, (id, name, label)) in [
+            ("detail-play", "play", "Play"),
+            ("detail-favorite", heart, heart_label),
+            ("detail-cover", "image", "Change cover"),
+            ("detail-close", "arrow-left", "Back"),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let (bg, fg) = if i == 0 { (rgb(self.appearance.accent), rgb(0x0c1417)) } else { (rgba(0xffffff1a), rgb(TEXT)) };
             let circle = self
@@ -676,7 +740,7 @@ impl Hub {
                     .items_center()
                     .gap_2()
                     .cursor_pointer()
-                    .when(i == 1 && details.loading, |d| d.opacity(0.5))
+                    .when(i == 2 && details.loading, |d| d.opacity(0.5))
                     .hover(|style| style.opacity(0.85))
                     .on_click(cx.listener(move |view, _, _, cx| view.details_action(i, cx)))
                     .child(circle)
@@ -773,16 +837,19 @@ impl Hub {
         self.visible(cx).iter().position(|&v| v == selected)
     }
 
-    /// Scrolls Settings so the card holding button `j` is visible (the page's children are
-    /// title, then a heading and a card per section; see settings_page).
-    fn scroll_settings_to(&self, j: usize) {
-        let child = match settings_items()[j] {
-            _ if j == 0 => 0, // first button: show the page title too
-            Setting::EmulationFolder | Setting::RomFolders | Setting::RetroArch | Setting::Cores => 2,
-            Setting::EmulatorFolder(_) | Setting::PickEmulator(_) | Setting::EmulatorSite(_) => 4,
-            Setting::Glass(_) | Setting::Palette(_) | Setting::Update => 6,
-        };
-        self.settings_scroll.scroll_to_item(child);
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.focus = Focus::Menu(self.current_menu());
+    }
+
+    fn toggle_favorite(&mut self, index: usize) {
+        let path = &self.games[index].path;
+        if !self.favorites.remove(path) {
+            self.favorites.insert(path.clone());
+        }
+        if let Err(error) = emu::save_favorites(&self.favorites) {
+            self.message = format!("Could not save favorites: {error}");
+        }
     }
 
     /// What each Settings button does, for both mouse clicks and the controller.
@@ -1073,7 +1140,7 @@ impl Hub {
     fn sidebar(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let tone = |selected: bool| rgb(if selected { 0xf5f3ee } else { MUTED });
         let all = self.view == View::Library && self.system.is_none();
-        let settings = self.view == View::Settings;
+        let settings = self.settings_open;
         let menu_len = self.menu().len();
         let focused = |i: usize| self.focus == Focus::Menu(i);
         let home = self.view == View::Home;
@@ -1140,7 +1207,7 @@ impl Hub {
                     .child(icon("settings", 18., tone(settings)))
                     .child("Settings")
                     .on_click(cx.listener(|view, _, _, cx| {
-                        view.view = View::Settings;
+                        view.settings_open = true;
                         cx.notify();
                     })),
             )
@@ -1200,7 +1267,37 @@ impl Hub {
             .child(grid)
     }
 
-    fn settings_page(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// The All Games side panel: the selected game's cover, facts and buttons.
+    fn game_panel(&self, cx: &mut Context<Self>) -> Div {
+        let panel = div().w(px(PANEL_WIDTH)).h_full().flex_none().p_6().flex().flex_col().gap_3().border_l_1().border_color(rgba(0xffffff14));
+        let Some(index) = self.selected else {
+            return panel.justify_center().items_center().text_color(rgb(MUTED)).child("Select a game to see it here.");
+        };
+        let game = &self.games[index];
+        let favorite = self.favorites.contains(&game.path);
+        let played = self.history.get(&game.path).map_or("Not played yet".into(), |&t| format!("Last played {}", emu::ago(t)));
+        panel
+            .child(div().w(px(200.)).h(px(300.)).flex_none().rounded_lg().overflow_hidden().shadow_lg().child(self.cover(index, 200.)))
+            .child(heading(system_name(&self.systems, &game.system)))
+            .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).line_clamp(3).child(game.name.clone()))
+            .child(div().flex().items_center().gap_2().text_color(rgb(MUTED)).child(icon("history", 16., rgb(MUTED))).child(played))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .pt_2()
+                    .child(Button::new("panel-play").primary().label("Play").on_click(cx.listener(move |view, _, _, cx| view.play(index, cx))))
+                    .child(Button::new("panel-favorite").label(if favorite { "Unfavorite" } else { "Favorite" }).on_click(cx.listener(move |view, _, _, cx| {
+                        view.toggle_favorite(index);
+                        cx.notify();
+                    })))
+                    .child(Button::new("panel-details").label("Details").on_click(cx.listener(move |view, _, _, cx| view.open_details(index, cx)))),
+            )
+    }
+
+    /// The Settings popup: categories on the left, the chosen category's card on the right.
+    fn settings_popup(&self, cx: &mut Context<Self>) -> Div {
         let paths = card()
             .child(setting_row("ROMs folder", "One subfolder per system, EmuDeck style (roms/snes, roms/gba…).").child(div().w(px(360.)).child(Input::new(&self.roms_dir))))
             .child(setting_row("RetroArch command", "Program and arguments, separated by spaces.").child(div().w(px(360.)).child(Input::new(&self.retroarch_cmd))))
@@ -1316,26 +1413,71 @@ impl Hub {
                 cx,
             )));
 
-        div()
-            .id("settings-page")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.settings_scroll)
-            .bg(self.appearance.fill(0x0c1417))
-            .p_8()
+        let body = match self.settings_cat {
+            0 => setup,
+            1 => emulators,
+            2 => looks,
+            _ => paths,
+        };
+        let mut categories = div().w(px(200.)).flex_none().p_3().flex().flex_col().gap_1().border_r_1().border_color(rgba(0xffffff14));
+        categories = categories.child(div().px_3().pt_2().pb_3().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child("Settings"));
+        for (c, name) in SETTING_CATEGORIES.into_iter().enumerate() {
+            categories = categories.child(
+                self.ring(self.nav_row(("settings-cat", c), self.settings_cat == c), self.focus == Focus::SettingsCat(c))
+                    .child(name)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.settings_cat = c;
+                        view.settings_scroll.scroll_to_item(0);
+                        cx.notify();
+                    })),
+            );
+        }
+        let content = div()
+            .flex_1()
+            .min_w_0()
+            .p_6()
             .flex()
             .flex_col()
             .gap_4()
-            .child(div().text_size(px(34.)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
-            // Controller-reachable sections first; Paths needs a keyboard anyway.
-            .child(div().pt_4().child(heading("Setup")))
-            .child(setup)
-            .child(div().pt_4().child(heading("Emulators")))
-            .child(emulators)
-            .child(div().pt_4().child(heading("Appearance")))
-            .child(looks)
-            .child(div().pt_4().child(heading("Paths")))
-            .child(paths)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child(SETTING_CATEGORIES[self.settings_cat]))
+                    .child(Button::new("settings-close").label("Close").on_click(cx.listener(|view, _, _, cx| {
+                        view.close_settings();
+                        cx.notify();
+                    }))),
+            )
+            .child(div().flex_1().min_h_0().child(body.id("settings-card").max_h_full().overflow_y_scroll().track_scroll(&self.settings_scroll)));
+        // Dims the page behind; solid even in Glass mode so the page doesn't show through the text.
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .occlude()
+            .child(
+                div()
+                    .w(px(920.))
+                    .max_w(relative(0.94))
+                    .h(relative(0.86))
+                    .max_h(px(640.))
+                    .flex()
+                    .rounded_lg()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(rgba(0xffffff1f))
+                    .bg(appearance::Appearance { glass: false, ..self.appearance }.fill(0x0c1417))
+                    .shadow_lg()
+                    .child(categories)
+                    .child(content),
+            )
     }
 
     fn save_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1363,13 +1505,23 @@ impl Hub {
         self.systems.iter().filter(|s| self.games.iter().any(|g| g.system == s.id)).collect()
     }
 
+    /// Favorite games in library order (the Favorites row).
+    fn favorite_games(&self) -> Vec<usize> {
+        (0..self.games.len()).filter(|&i| self.favorites.contains(&self.games[i].path)).collect()
+    }
+
+    /// The games in a Home game row: 0 Continue Playing, 1 Favorites.
+    fn home_games(&self, row: usize) -> Vec<usize> {
+        if row == 0 { self.recent() } else { self.favorite_games() }
+    }
+
     fn home_row_len(&self, row: usize) -> usize {
-        if row == 0 { self.recent().len() } else { self.home_systems().len() }
+        if row < 2 { self.home_games(row).len() } else { self.home_systems().len() }
     }
 
     /// First Home row with something in it, for entering Home with the controller.
     fn enter_home(&mut self) {
-        if let Some(row) = (0..2).find(|&r| self.home_row_len(r) > 0) {
+        if let Some(row) = (0..3).find(|&r| self.home_row_len(r) > 0) {
             self.focus = Focus::Home(row, 0);
             self.home_scroll[row].scroll_to_item(0);
             self.scroll_home_to(row);
@@ -1378,11 +1530,12 @@ impl Hub {
 
     /// Scrolls Home so row `row` is visible; the top row also brings the hero back into view.
     fn scroll_home_to(&self, row: usize) {
-        let has_recent = !self.recent().is_empty();
-        let child = if row == 0 || !has_recent { 0 } else { 3 }; // hero, divider, Continue Playing, Systems
-        self.home_page_scroll.scroll_to_item(child);
-        if child == 3 {
-            // scroll_to_item only reveals the row's top part when it's taller than what's left; Systems is the last row.
+        // Page children: hero, divider, then each row that's shown (Systems always is).
+        let shown: Vec<usize> = (0..3).filter(|&r| r == 2 || self.home_row_len(r) > 0).collect();
+        let pos = shown.iter().position(|&r| r == row).unwrap_or(0);
+        self.home_page_scroll.scroll_to_item(if pos == 0 { 0 } else { 2 + pos });
+        if pos > 0 && pos + 1 == shown.len() {
+            // scroll_to_item only reveals the row's top part when it's taller than what's left.
             self.home_page_scroll.scroll_to_bottom();
         }
     }
@@ -1398,22 +1551,25 @@ impl Hub {
                 self.home_scroll[row].scroll_to_item(col);
             }
             Pad::Up | Pad::Down => {
-                let other = 1 - row;
-                let other_len = self.home_row_len(other);
-                if other_len > 0 {
-                    let col = col.min(other_len - 1);
+                let other = if action == Pad::Up {
+                    (0..row).rev().find(|&r| self.home_row_len(r) > 0)
+                } else {
+                    (row + 1..3).find(|&r| self.home_row_len(r) > 0)
+                };
+                if let Some(other) = other {
+                    let col = col.min(self.home_row_len(other) - 1);
                     self.focus = Focus::Home(other, col);
                     self.home_scroll[other].scroll_to_item(col);
                     self.scroll_home_to(other);
                 }
             }
-            Pad::Confirm if row == 0 => {
-                if let Some(&game) = self.recent().get(col) {
+            Pad::Confirm if row < 2 => {
+                if let Some(&game) = self.home_games(row).get(col) {
                     self.play(game, cx);
                 }
             }
-            Pad::Options if row == 0 => {
-                if let Some(&game) = self.recent().get(col) {
+            Pad::Options if row < 2 => {
+                if let Some(&game) = self.home_games(row).get(col) {
                     self.open_details(game, cx);
                 }
             }
@@ -1491,10 +1647,41 @@ impl Hub {
         cards
     }
 
+    /// A Home row of covers (Continue Playing or Favorites): click selects, double-click plays, right-click opens the game page.
+    fn game_row(&self, row: usize, games: &[usize], cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut cards = div().id(("game-row", row)).flex().gap_4().px_6().pb_2().overflow_x_scroll().track_scroll(&self.home_scroll[row]);
+        for (col, &index) in games.iter().enumerate() {
+            cards = cards.child(
+                self.ring(div().id(("home-game", row * 100_000 + col)).w(px(120.)).h(px(180.)).flex_none().rounded_lg().overflow_hidden(), self.focus == Focus::Home(row, col))
+                    .cursor_pointer()
+                    .bg(rgba(0xffffff0a))
+                    .child(self.cover(index, 120.))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                            view.focus = Focus::Home(row, col);
+                            view.open_details(index, cx);
+                        }),
+                    )
+                    .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
+                        view.focus = Focus::Home(row, col);
+                        view.selected = Some(index);
+                        if event.click_count() >= 2 {
+                            view.play(index, cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        cards
+    }
+
     fn home_page(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let recent = self.recent();
+        let favorites = self.favorite_games();
         let hero_index = match self.focus {
             Focus::Home(0, c) => recent.get(c),
+            Focus::Home(1, c) => favorites.get(c),
             _ => recent.first(),
         }
         .copied();
@@ -1532,7 +1719,7 @@ impl Hub {
                             .items_center()
                             .gap_2()
                             .child(icon("history", 16., rgb(MUTED)))
-                            .child(self.history.get(&game.path).map(|&t| emu::ago(t)).unwrap_or_default()),
+                            .child(self.history.get(&game.path).map_or("Not played yet".into(), |&t| emu::ago(t))),
                     )
                     .child(
                         div()
@@ -1576,37 +1763,12 @@ impl Hub {
             div().px_6().pt_5().pb_2().child(title)
         };
 
-        let mut continue_row = div().id("recent-row").flex().gap_4().px_6().pb_2().overflow_x_scroll().track_scroll(&self.home_scroll[0]);
-        for (col, &index) in recent.iter().enumerate() {
-            continue_row = continue_row.child(
-                self.ring(div().id(("recent", col)).w(px(120.)).h(px(180.)).flex_none().rounded_lg().overflow_hidden(), self.focus == Focus::Home(0, col))
-                    .cursor_pointer()
-                    .bg(rgba(0xffffff0a))
-                    .child(self.cover(index, 120.))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |view, _: &MouseDownEvent, _, cx| {
-                            view.focus = Focus::Home(0, col);
-                            view.open_details(index, cx);
-                        }),
-                    )
-                    .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
-                        view.focus = Focus::Home(0, col);
-                        view.selected = Some(index);
-                        if event.click_count() >= 2 {
-                            view.play(index, cx);
-                        }
-                        cx.notify();
-                    })),
-            );
-        }
-
-        let mut systems_row = div().id("systems-row").flex().gap_4().px_6().pb_6().overflow_x_scroll().track_scroll(&self.home_scroll[1]);
+        let mut systems_row = div().id("systems-row").flex().gap_4().px_6().pb_6().overflow_x_scroll().track_scroll(&self.home_scroll[2]);
         for (col, system) in self.home_systems().into_iter().enumerate() {
             let count = self.games.iter().filter(|g| g.system == system.id).count();
             let id = system.id.clone();
             systems_row = systems_row.child(
-                self.ring(div().id(("system", col)).w(px(150.)).h(px(110.)).flex_none().rounded_lg(), self.focus == Focus::Home(1, col))
+                self.ring(div().id(("system", col)).w(px(150.)).h(px(110.)).flex_none().rounded_lg(), self.focus == Focus::Home(2, col))
                     .cursor_pointer()
                     .bg(rgba(0xffffff0a))
                     .hover(|style| style.bg(rgba(0xffffff14)))
@@ -1629,8 +1791,8 @@ impl Hub {
             );
         }
 
-        let focused_name = match self.focus {
-            Focus::Home(0, c) => recent.get(c).map(|&i| self.games[i].name.as_str()),
+        let focused_name = |row: usize, games: &[usize]| match self.focus {
+            Focus::Home(r, c) if r == row => games.get(c).map(|&i| self.games[i].name.clone()),
             _ => None,
         };
         let mut page = div()
@@ -1643,8 +1805,10 @@ impl Hub {
             .flex_col()
             .child(hero)
             .child(div().h(px(1.)).bg(rgba((accent << 8) | 0x30)));
-        if !recent.is_empty() {
-            page = page.child(div().child(row_title("Continue Playing", focused_name)).child(continue_row));
+        for (row, title, games) in [(0, "Continue Playing", &recent), (1, "Favorites", &favorites)] {
+            if !games.is_empty() {
+                page = page.child(div().child(row_title(title, focused_name(row, games).as_deref())).child(self.game_row(row, games, cx)));
+            }
         }
         page.child(div().child(row_title("Systems", None)).child(systems_row))
     }
@@ -1658,9 +1822,9 @@ impl Hub {
         }
         match self.focus {
             Focus::Menu(_) => vec![(Hint::Confirm, "Open"), (Hint::Bumpers, "Switch system")],
-            Focus::Grid | Focus::Home(0, _) => vec![(Hint::Confirm, "Play"), (Hint::Options, "Details"), (Hint::Back, "Back")],
+            Focus::Grid | Focus::Home(0 | 1, _) => vec![(Hint::Confirm, "Play"), (Hint::Options, "Details"), (Hint::Back, "Back")],
             Focus::Home(..) => vec![(Hint::Confirm, "Open"), (Hint::Back, "Back")],
-            Focus::Settings(_) => vec![(Hint::Confirm, "Select"), (Hint::Back, "Back")],
+            Focus::Settings(_) | Focus::SettingsCat(_) => vec![(Hint::Confirm, "Select"), (Hint::Back, "Back")],
         }
     }
 
@@ -1728,22 +1892,24 @@ impl Render for Hub {
         let on_page = match self.focus {
             Focus::Menu(i) => i < self.menu().len(),
             Focus::Grid => self.view == View::Library,
-            Focus::Settings(_) => self.view == View::Settings,
+            Focus::Settings(_) | Focus::SettingsCat(_) => self.settings_open,
             Focus::Home(..) => self.view == View::Home,
         };
-        if !on_page {
+        if self.settings_open && !matches!(self.focus, Focus::Settings(_) | Focus::SettingsCat(_)) {
+            // Opened with the mouse: the controller drives the popup, not the page behind it.
+            self.focus = Focus::SettingsCat(self.settings_cat);
+        } else if !on_page {
             self.focus = Focus::Menu(self.current_menu());
         }
         // Sidebar, window padding, border and grid padding; each card is 150px plus a 20px gap.
-        let chrome = if self.sidebar_open { 256. } else { 0. } + 16. + 4. + 2. + 48.;
+        let chrome = if self.sidebar_open { 256. } else { 0. } + 16. + 4. + 2. + 48. + if self.view == View::Library { PANEL_WIDTH } else { 0. };
         let content = window.viewport_size().width / px(1.) - chrome;
         self.columns = ((content + 20.) / 170.).floor().max(1.) as usize;
         let visible = self.visible(cx);
         self.visible_cache = visible.clone();
         let page = match self.view {
             View::Home => self.home_page(cx),
-            View::Library => self.library_page(&visible, cx),
-            View::Settings => self.settings_page(cx),
+            View::Library => div().id("library-split").size_full().flex().child(self.library_page(&visible, cx).flex_1().min_w_0()).child(self.game_panel(cx)),
         };
         let mut body = div().flex_1().min_h_0().flex().p_2().gap_1();
         if self.sidebar_open {
@@ -1796,6 +1962,7 @@ impl Render for Hub {
                 None => body.into_any_element(),
             })
             .child(self.bottom_bar())
+            .when(self.settings_open && self.details.is_none(), |d| d.child(self.settings_popup(cx)))
             .children(self.update_popup(cx))
     }
 }
