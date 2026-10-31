@@ -33,6 +33,7 @@ WizardStyle=modern
 CloseApplications=yes
 
 [Tasks]
+Name: "startmenuicon"; Description: "Add to the Start menu"; GroupDescription: "Shortcuts:"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 
 [Files]
@@ -40,7 +41,7 @@ Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: igno
 Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: startmenuicon
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
