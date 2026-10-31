@@ -186,6 +186,22 @@ fn start(exe: &Path) -> Command {
 }
 
 /// Opens a web page in the default browser.
+pub const RELEASES_URL: &str = "https://github.com/veneito/EmuHub/releases/latest";
+
+/// The latest release's version (like "0.2.0") if it's newer than this build. Reads only the tag name
+/// from GitHub's API over HTTPS; any error just means no update is shown.
+pub fn newer_release() -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(&download("https://api.github.com/repos/veneito/EmuHub/releases/latest", None).ok()?).ok()?;
+    let latest = json["tag_name"].as_str()?.trim_start_matches('v');
+    is_newer(latest, env!("CARGO_PKG_VERSION")).then(|| latest.to_owned())
+}
+
+/// Compares "1.10.0" > "1.9.2" by number, part by part.
+fn is_newer(latest: &str, current: &str) -> bool {
+    let parts = |v: &str| v.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    parts(latest) > parts(current)
+}
+
 pub fn open_url(url: &str) -> Result<(), String> {
     open_folder(Path::new(url))
 }
@@ -876,6 +892,14 @@ mod tests {
         let text = retroarch_overrides(&dir.join("roms"));
         assert!(text.contains("system_directory") && !text.contains("savefile_directory"));
         assert!(text.contains("input_quit_gamepad_combo = \"4\""));
+    }
+
+    #[test]
+    fn versions_compare_by_number() {
+        assert!(is_newer("0.10.0", "0.9.1"));
+        assert!(is_newer("0.2.0", "0.1.0"));
+        assert!(!is_newer("0.1.0", "0.1.0"));
+        assert!(!is_newer("garbage", "0.1.0"));
     }
 
     #[test]

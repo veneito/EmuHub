@@ -67,6 +67,8 @@ enum Setting {
     EmulatorSite(usize),
     /// Create and open Emulation/tools/<emulator>, to unzip it into.
     EmulatorFolder(usize),
+    /// Open the releases page to download a newer EmuHub.
+    Update,
 }
 
 /// The full-screen game page (right-click or Options). `focus` walks Play, Change cover, Back, then the cover choices.
@@ -100,6 +102,7 @@ fn settings_items() -> Vec<Setting> {
     }
     items.extend([Setting::Glass(false), Setting::Glass(true)]);
     items.extend((0..PALETTES.len()).map(Setting::Palette));
+    items.push(Setting::Update);
     items
 }
 
@@ -143,6 +146,8 @@ struct Hub {
     /// When each game was last played, for Continue Playing.
     history: std::collections::HashMap<std::path::PathBuf, u64>,
     message: String,
+    /// The newer release's version, once the startup check finds one.
+    update: Option<String>,
     appearance: appearance::Appearance,
 }
 
@@ -304,9 +309,20 @@ impl Hub {
             settings_scroll: ScrollHandle::new(),
             history: emu::load_history(),
             message: String::new(),
+            update: None,
             appearance,
         };
         hub.rescan(cx);
+        // Only asks GitHub for the latest version number; nothing is downloaded or installed.
+        cx.spawn(async move |this, cx| {
+            let Some(version) = cx.background_executor().spawn(async { emu::newer_release() }).await else { return };
+            let _ = this.update(cx, |view, cx| {
+                view.message = format!("EmuHub {version} is available. Settings → Download.");
+                view.update = Some(version);
+                cx.notify();
+            });
+        })
+        .detach();
         hub
     }
 
@@ -744,7 +760,7 @@ impl Hub {
             _ if j == 0 => 0, // first button: show the page title too
             Setting::EmulationFolder | Setting::RomFolders | Setting::RetroArch | Setting::Cores => 2,
             Setting::EmulatorFolder(_) | Setting::PickEmulator(_) | Setting::EmulatorSite(_) => 4,
-            Setting::Glass(_) | Setting::Palette(_) => 6,
+            Setting::Glass(_) | Setting::Palette(_) | Setting::Update => 6,
         };
         self.settings_scroll.scroll_to_item(child);
     }
@@ -838,6 +854,7 @@ impl Hub {
                     .err()
                     .unwrap_or_default();
             }
+            Setting::Update => self.message = emu::open_url(emu::RELEASES_URL).err().unwrap_or_default(),
             Setting::EmulatorSite(i) => self.message = emu::open_url(emu::EMULATORS[i].site).err().unwrap_or_default(),
             Setting::Palette(i) => {
                 let (_, surface, accent) = PALETTES[i];
@@ -1158,7 +1175,19 @@ impl Hub {
         }
         let looks = card()
             .child(setting_row("Window material", "Glass blurs the desktop behind the window (Windows and macOS).").child(modes))
-            .child(setting_row("Theme", "Preset colors for the whole window.").child(palettes));
+            .child(setting_row("Theme", "Preset colors for the whole window.").child(palettes))
+            .child(setting_row(
+                &format!("EmuHub {}", env!("CARGO_PKG_VERSION")),
+                &match &self.update {
+                    Some(version) => format!("Version {version} is available."),
+                    None => "Up to date, or the update check couldn't reach GitHub.".into(),
+                },
+            )
+            .child(self.setting_button(
+                Setting::Update,
+                Button::new("update").label(if self.update.is_some() { "Download" } else { "Releases" }).selected(self.update.is_some()),
+                cx,
+            )));
 
         div()
             .id("settings-page")
