@@ -48,6 +48,17 @@ enum Setting {
     Palette(usize),
 }
 
+/// The game details window (right-click or Options). `focus` walks Play, Change cover, Close, then the cover choices.
+struct Details {
+    game: usize,
+    /// None until "Change cover" is pressed; then the downloaded choices.
+    candidates: Option<Vec<emu::Candidate>>,
+    loading: bool,
+    focus: usize,
+}
+
+const DETAIL_BUTTONS: usize = 3;
+
 const PALETTES: [(&str, u32, u32); 5] = [
     ("Teal", 0x0c1417, 0x92c8e5),
     ("Graphite", 0x151515, 0xc4c4ce),
@@ -84,6 +95,7 @@ struct Hub {
     sidebar_open: bool,
     busy: bool,
     focus: Focus,
+    details: Option<Details>,
     /// Focus rings only show once a controller has been used, so mouse users don't see them.
     pad_used: bool,
     /// Controller input is ignored while another window (e.g. a running game) has focus.
@@ -225,6 +237,7 @@ impl Hub {
             sidebar_open: true,
             busy: false,
             focus: Focus::Menu(0),
+            details: None,
             pad_used: false,
             active: true,
             columns: 1,
@@ -325,6 +338,11 @@ impl Hub {
             return;
         }
         self.pad_used = true;
+        if self.details.is_some() {
+            self.details_pad(action, cx);
+            cx.notify();
+            return;
+        }
         let menu = self.menu();
         match (self.focus, action) {
             (_, Pad::PrevTab | Pad::NextTab) => {
@@ -359,6 +377,11 @@ impl Hub {
                 Some(i) => self.play(i, cx),
                 None => self.move_selection(0, cx),
             },
+            (Focus::Grid, Pad::Options) => {
+                if let Some(i) = self.selected {
+                    self.open_details(i, cx)
+                }
+            }
             (Focus::Grid, Pad::Left) => self.move_selection(-1, cx),
             (Focus::Grid, Pad::Right) => self.move_selection(1, cx),
             (Focus::Grid, Pad::Up) => self.move_selection(-(self.columns as isize), cx),
@@ -368,9 +391,166 @@ impl Hub {
             (Focus::Settings(j), Pad::Up) => self.focus = Focus::Settings(j.saturating_sub(1)),
             (Focus::Settings(j), Pad::Down) => self.focus = Focus::Settings((j + 1).min(SETTINGS.len() - 1)),
             (Focus::Settings(j), Pad::Confirm) => self.apply_setting(SETTINGS[j], window, cx),
-            (Focus::Settings(_), Pad::Right) => {}
+            (Focus::Settings(_), Pad::Right | Pad::Options) => {}
         }
         cx.notify();
+    }
+
+    fn open_details(&mut self, game: usize, cx: &mut Context<Self>) {
+        self.selected = Some(game);
+        self.details = Some(Details { game, candidates: None, loading: false, focus: 0 });
+        cx.notify();
+    }
+
+    /// Controller in the details window: any direction steps through the buttons and cover choices.
+    fn details_pad(&mut self, action: Pad, cx: &mut Context<Self>) {
+        let Some(details) = &mut self.details else { return };
+        let count = DETAIL_BUTTONS + details.candidates.as_ref().map_or(0, Vec::len);
+        match action {
+            Pad::Back | Pad::Options => self.details = None,
+            Pad::Left | Pad::Up => details.focus = details.focus.saturating_sub(1),
+            Pad::Right | Pad::Down => details.focus = (details.focus + 1).min(count - 1),
+            Pad::Confirm => {
+                let focus = details.focus;
+                self.details_action(focus, cx)
+            }
+            Pad::PrevTab | Pad::NextTab => {}
+        }
+    }
+
+    /// 0 = Play, 1 = Change cover, 2 = Close, 3.. = pick that cover.
+    fn details_action(&mut self, item: usize, cx: &mut Context<Self>) {
+        let Some(details) = &mut self.details else { return };
+        let game = self.games[details.game].clone();
+        match item {
+            0 => {
+                let index = details.game;
+                self.details = None;
+                self.play(index, cx);
+            }
+            1 if !details.loading => {
+                details.loading = true;
+                details.candidates = None;
+                let key = self.config.steamgriddb_key.clone();
+                cx.spawn(async move |this, cx| {
+                    let found = cx.background_executor().spawn(async move { emu::cover_candidates(&game, &key) }).await;
+                    let _ = this.update(cx, |view, cx| {
+                        if let Some(details) = &mut view.details {
+                            details.loading = false;
+                            details.candidates = Some(found);
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            1 => {}
+            2 => self.details = None,
+            n => {
+                let Some(choice) = details.candidates.as_ref().and_then(|c| c.get(n - DETAIL_BUTTONS)) else { return };
+                let url = choice.url.clone();
+                self.run("Downloading cover…", move |_| emu::set_cover(&game, &url).map(|()| "Cover updated.".into()), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn details_window(&self, details: &Details, cx: &mut Context<Self>) -> Stateful<Div> {
+        let game = &self.games[details.game];
+        let cover = emu::cover_path(game);
+        let art = if cover.exists() {
+            img(cover).size_full().object_fit(ObjectFit::Cover).into_any_element()
+        } else {
+            tile(&game.name, 160.).size_full().rounded_none().into_any_element()
+        };
+        let focused = |i: usize| details.focus == i;
+        let mut buttons = div().flex().gap_2().pt_2();
+        for (i, (id, label)) in [("detail-play", "Play"), ("detail-cover", "Change cover"), ("detail-close", "Close")].into_iter().enumerate() {
+            let mut button = Button::new(id).label(label);
+            if i == 0 {
+                button = button.primary();
+            }
+            buttons = buttons.child(
+                self.ring(div().rounded_md(), focused(i))
+                    .child(button.disabled(i == 1 && details.loading).on_click(cx.listener(move |view, _, _, cx| view.details_action(i, cx)))),
+            );
+        }
+
+        let mut panel = div()
+            .id("details-panel")
+            .w(px(820.))
+            .max_h(px(640.))
+            .overflow_y_scroll()
+            .p_6()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgba(0xffffff14))
+            // Always solid, even in Glass mode, so the library doesn't show through the text.
+            .bg(appearance::Appearance { glass: false, ..self.appearance }.fill(0x101e23))
+            .child(
+                div()
+                    .flex()
+                    .gap_6()
+                    .child(div().w(px(160.)).h(px(240.)).flex_none().rounded_lg().overflow_hidden().child(art))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(heading(system_name(&self.systems, &game.system)))
+                            .child(div().text_size(px(26.)).font_weight(FontWeight::SEMIBOLD).child(game.name.clone()))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(game.path.display().to_string()))
+                            .child(buttons),
+                    ),
+            );
+
+        if details.loading {
+            panel = panel.child(div().text_color(rgb(MUTED)).child("Finding covers…"));
+        } else if let Some(candidates) = &details.candidates {
+            let mut choices = div().flex().flex_wrap().gap_4();
+            for (n, choice) in candidates.iter().enumerate() {
+                let item = DETAIL_BUTTONS + n;
+                choices = choices.child(
+                    div()
+                        .id(("cover-choice", n))
+                        .w(px(110.))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| view.details_action(item, cx)))
+                        .child(
+                            self.ring(div().w(px(110.)).h(px(165.)).rounded_md().overflow_hidden(), focused(item))
+                                .child(img(choice.preview.clone()).size_full().object_fit(ObjectFit::Cover)),
+                        )
+                        .child(div().text_xs().text_color(rgb(MUTED)).line_clamp(2).child(choice.label.clone())),
+                );
+            }
+            panel = panel.child(heading("Choose a cover")).child(if candidates.is_empty() {
+                div().text_color(rgb(MUTED)).child("No other covers found. Add a SteamGridDB key in Settings for more choices.")
+            } else {
+                choices
+            });
+        }
+
+        // Full-window backdrop that blocks clicks to the library underneath.
+        div()
+            .id("details")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .occlude()
+            .bg(rgba(0x000000b0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(panel)
     }
 
     /// Position of the selected game within the visible list.
@@ -600,6 +780,13 @@ impl Hub {
                     .flex_col()
                     .gap_2()
                     .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                            view.focus = Focus::Grid;
+                            view.open_details(index, cx);
+                        }),
+                    )
                     .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
                         view.selected = Some(index);
                         view.focus = Focus::Grid;
@@ -881,6 +1068,7 @@ impl Render for Hub {
             )
             .child(body)
             .child(self.bottom_bar(cx))
+            .children(self.details.as_ref().map(|d| self.details_window(d, cx)))
     }
 }
 

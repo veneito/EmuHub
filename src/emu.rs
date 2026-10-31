@@ -297,54 +297,187 @@ fn search_title(name: &str) -> &str {
     name.split(" (").next().unwrap_or(name).split(" [").next().unwrap_or(name).trim()
 }
 
-/// Where a game's cover is cached on disk.
-pub fn cover_path(game: &Game) -> PathBuf {
-    config_dir().join("covers").join(&game.system).join(format!("{}.png", thumb_name(&game.name)))
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
-fn steamgrid_url(key: &str, name: &str) -> Result<Option<String>, String> {
+fn cover_dir(game: &Game) -> PathBuf {
+    config_dir().join("covers").join(&game.system)
+}
+
+/// The automatically downloaded cover.
+fn default_cover(game: &Game) -> PathBuf {
+    cover_dir(game).join(format!("{}.png", thumb_name(&game.name)))
+}
+
+/// Where a game's cover is on disk. A cover picked in the details window is saved under a new file name
+/// (GPUI caches images by path, so overwriting wouldn't show) and recorded in a ".cover" file.
+pub fn cover_path(game: &Game) -> PathBuf {
+    let default = default_cover(game);
+    match std::fs::read_to_string(default.with_extension("cover")) {
+        Ok(file) if !file.trim().is_empty() => cover_dir(game).join(file.trim()),
+        _ => default,
+    }
+}
+
+fn libretro_url(sys: &System, name: &str) -> String {
+    format!("https://thumbnails.libretro.com/{}/Named_Boxarts/{}.png", url_encode(&sys.thumbs), url_encode(name))
+}
+
+/// Every box-art name libretro has for a system, cached on disk because the listing is about 2 MB.
+fn libretro_names(sys: &System) -> Vec<String> {
+    let cache = config_dir().join("listings").join(format!("{}.txt", sys.id));
+    // shortcut: the listing is cached forever; delete the listings folder to pick up newly added libretro art.
+    let text = match std::fs::read_to_string(&cache) {
+        Ok(text) => text,
+        Err(_) => {
+            let Ok(html) = download(&format!("https://thumbnails.libretro.com/{}/Named_Boxarts/", url_encode(&sys.thumbs)), None) else {
+                return vec![];
+            };
+            let text = parse_listing(&String::from_utf8_lossy(&html)).join("\n");
+            let _ = write_atomic(&cache, text.as_bytes());
+            text
+        }
+    };
+    text.lines().map(String::from).collect()
+}
+
+/// Pulls the .png names out of libretro's directory listing page.
+fn parse_listing(html: &str) -> Vec<String> {
+    html.split("href=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .filter_map(|href| href.strip_suffix(".png"))
+        .map(percent_decode)
+        .collect()
+}
+
+/// libretro names for the same title, best first: USA, then World/Europe, then other regions; demos and betas last.
+fn libretro_matches(game: &Game, names: &[String]) -> Vec<String> {
+    let title = search_title(&thumb_name(&game.name)).to_lowercase();
+    let mut found: Vec<&String> = names.iter().filter(|n| search_title(n).to_lowercase() == title).collect();
+    found.sort_by_key(|n| {
+        let n = n.to_lowercase();
+        let junk = ["demo", "beta", "proto", "kiosk", "sample"].iter().any(|w| n.contains(w));
+        (junk, !n.contains("usa"), !(n.contains("world") || n.contains("europe")))
+    });
+    found.into_iter().cloned().collect()
+}
+
+/// (preview, full image) URL pairs from SteamGridDB for the game's title, portrait grids only.
+fn steamgrid_grids(key: &str, name: &str) -> Result<Vec<(String, String)>, String> {
     let auth = format!("Bearer {key}");
     let get = |url: &str| -> Result<serde_json::Value, String> {
         serde_json::from_slice(&download(url, Some(&auth))?).map_err(|e| e.to_string())
     };
     let found = get(&format!("https://www.steamgriddb.com/api/v2/search/autocomplete/{}", url_encode(search_title(name))))?;
-    let Some(id) = found["data"][0]["id"].as_u64() else { return Ok(None) };
+    let Some(id) = found["data"][0]["id"].as_u64() else { return Ok(vec![]) };
     let grids = get(&format!("https://www.steamgriddb.com/api/v2/grids/game/{id}?dimensions=600x900"))?;
-    Ok(grids["data"][0]["url"].as_str().map(String::from))
+    Ok(grids["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| Some((g["thumb"].as_str()?.to_owned(), g["url"].as_str()?.to_owned())))
+        .collect())
 }
 
-/// Downloads a cover into the cache: libretro-thumbnails first, then SteamGridDB if a key is set.
-/// Returns true if a cover now exists. A miss is remembered with a ".miss" file so it's tried once.
+/// Downloads a cover into the cache: libretro by exact name, then libretro's closest name, then SteamGridDB
+/// if a key is set. Returns true if a cover now exists. A miss is remembered so it's only tried once.
 pub fn fetch_cover(game: &Game, steamgriddb_key: &str) -> bool {
-    let path = cover_path(game);
-    let miss = path.with_extension("miss");
-    if path.exists() {
+    if cover_path(game).exists() {
         return true;
     }
+    // Earlier versions wrote ".miss" before fuzzy matching existed; those are ignored so the game gets another try.
+    let miss = default_cover(game).with_extension("nocover");
     if miss.exists() {
         return false;
     }
     let Some(sys) = systems().into_iter().find(|s| s.id == game.system) else { return false };
-    let libretro = format!(
-        "https://thumbnails.libretro.com/{}/Named_Boxarts/{}.png",
-        url_encode(&sys.thumbs),
-        url_encode(&thumb_name(&game.name))
-    );
-    let mut bytes = download(&libretro, None).ok();
+    let mut bytes = download(&libretro_url(&sys, &thumb_name(&game.name)), None).ok();
+    if bytes.is_none() {
+        if let Some(best) = libretro_matches(game, &libretro_names(&sys)).first() {
+            bytes = download(&libretro_url(&sys, best), None).ok();
+        }
+    }
     if bytes.is_none() && !steamgriddb_key.is_empty() {
-        match steamgrid_url(steamgriddb_key, &game.name) {
-            Ok(Some(url)) => bytes = download(&url, None).ok(),
-            Ok(None) => {}
+        match steamgrid_grids(steamgriddb_key, &game.name) {
+            Ok(grids) => bytes = grids.first().and_then(|(_, url)| download(url, None).ok()),
             Err(_) => return false, // network/API error: don't record a miss, retry next launch
         }
     }
     match bytes {
-        Some(bytes) => write_atomic(&path, &bytes).is_ok(),
+        Some(bytes) => write_atomic(&default_cover(game), &bytes).is_ok(),
         None => {
             let _ = write_atomic(&miss, b"");
             false
         }
     }
+}
+
+/// A cover the user can pick in the details window.
+#[derive(Clone)]
+pub struct Candidate {
+    pub preview: PathBuf,
+    pub url: String,
+    /// Region for libretro choices ("USA, Australia"), or "SteamGridDB".
+    pub label: String,
+}
+
+/// Downloads previews of every cover option: libretro's matching regions, then SteamGridDB's grids.
+pub fn cover_candidates(game: &Game, steamgriddb_key: &str) -> Vec<Candidate> {
+    use std::hash::{Hash, Hasher};
+    let Some(sys) = systems().into_iter().find(|s| s.id == game.system) else { return vec![] };
+    let mut options: Vec<(String, String, String)> = libretro_matches(game, &libretro_names(&sys))
+        .into_iter()
+        .take(8)
+        .map(|name| {
+            let url = libretro_url(&sys, &name);
+            let region = name.get(search_title(&name).len()..).unwrap_or("").trim().replace(") (", ", ");
+            (url.clone(), url, region.trim_matches(['(', ')']).to_owned())
+        })
+        .collect();
+    if !steamgriddb_key.is_empty() {
+        let grids = steamgrid_grids(steamgriddb_key, &game.name).unwrap_or_default();
+        options.extend(grids.into_iter().take(12).map(|(thumb, url)| (thumb, url, "SteamGridDB".to_owned())));
+    }
+    let dir = config_dir().join("previews");
+    options
+        .into_iter()
+        .filter_map(|(preview_url, url, label)| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            preview_url.hash(&mut hasher);
+            let preview = dir.join(format!("{:016x}.img", hasher.finish()));
+            if !preview.exists() {
+                write_atomic(&preview, &download(&preview_url, None).ok()?).ok()?;
+            }
+            Some(Candidate { preview, url, label })
+        })
+        .collect()
+}
+
+/// Downloads the chosen cover and makes it the game's cover.
+pub fn set_cover(game: &Game, url: &str) -> Result<(), String> {
+    let bytes = download(url, None)?;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let file = format!("{}.{stamp}.png", thumb_name(&game.name));
+    write_atomic(&cover_dir(game).join(&file), &bytes)?;
+    write_atomic(&default_cover(game).with_extension("cover"), file.as_bytes())
 }
 
 #[cfg(test)]
@@ -393,5 +526,15 @@ mod tests {
         assert_eq!(search_title("Sonic [!]"), "Sonic");
         assert_eq!(thumb_name("Q*bert: Arcade"), "Q_bert_ Arcade");
         assert_eq!(url_encode("A B(1)"), "A%20B%281%29");
+        assert_eq!(percent_decode("Mario%20Kart%20DS%20(USA,%20Australia)"), "Mario Kart DS (USA, Australia)");
+    }
+
+    #[test]
+    fn short_names_find_the_best_libretro_region() {
+        let html = r#"<a href="Mario%20Kart%20DS%20(Japan).png">x</a><a href="Mario%20Kart%20DS%20(Europe)%20(Demo).png">x</a>
+            <a href="Mario%20Kart%20DS%20(USA,%20Australia).png">x</a><a href="Mario%20Party%20DS%20(USA).png">x</a>"#;
+        let names = parse_listing(html);
+        let game = Game { system: "nds".into(), name: "Mario Kart DS".into(), path: PathBuf::new() };
+        assert_eq!(libretro_matches(&game, &names), ["Mario Kart DS (USA, Australia)", "Mario Kart DS (Japan)", "Mario Kart DS (Europe) (Demo)"]);
     }
 }

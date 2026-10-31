@@ -12,6 +12,8 @@ pub enum Pad {
     Back,
     PrevTab,
     NextTab,
+    /// Start / Options / Menu button: opens a game's details.
+    Options,
 }
 
 pub type Queue = Arc<Mutex<Vec<Pad>>>;
@@ -73,6 +75,7 @@ fn map(event: EventType, stick: &mut Stick) -> Option<Pad> {
             // gilrs calls the shoulder bumpers LeftTrigger/RightTrigger (the analog ones are *Trigger2).
             Button::LeftTrigger => Some(Pad::PrevTab),
             Button::RightTrigger => Some(Pad::NextTab),
+            Button::Start => Some(Pad::Options),
             _ => None,
         },
         EventType::AxisChanged(Axis::LeftStickX, v, _) => {
