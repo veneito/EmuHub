@@ -801,9 +801,11 @@ fn shrink_cover(bytes: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Shrinks a cover saved by an older EmuHub in place. Cheap when it's already small (size check only).
+/// Shrinks a cover saved by an older EmuHub in place. Cheap when it's already small: only the file size
+/// and image header are read, so this doesn't decode every big-but-narrow cover on each launch.
 pub fn shrink_cached_cover(path: &Path) {
-    if std::fs::metadata(path).is_ok_and(|m| m.len() > 150_000) {
+    let big = std::fs::metadata(path).is_ok_and(|m| m.len() > 150_000);
+    if big && image::image_dimensions(path).is_ok_and(|(w, _)| w > COVER_WIDTH) {
         if let Ok(bytes) = std::fs::read(path) {
             let small = shrink_cover(&bytes);
             if small.len() < bytes.len() {
