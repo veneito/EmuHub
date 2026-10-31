@@ -503,15 +503,24 @@ impl Hub {
             ));
 
         let setup = card()
-            .child(setting_row("ROM folders", "Creates a folder for every supported system.").child(
-                Button::new("create-folders").label("Create").on_click(cx.listener(|view, _, _, cx| {
-                    view.message = match emu::create_folders(&view.config) {
-                        Ok(()) => format!("Created folders in {}", view.config.roms_dir.display()),
-                        Err(error) => error,
-                    };
-                    view.rescan(cx);
-                })),
-            ))
+            .child(if self.config.roms_dir.is_dir() {
+                setting_row("ROM folders", "Put each game in its system's folder, then Rescan.").child(
+                    Button::new("open-folders").label("Open").on_click(cx.listener(|view, _, _, cx| {
+                        view.message = emu::open_folder(&view.config.roms_dir).err().unwrap_or_default();
+                        cx.notify();
+                    })),
+                )
+            } else {
+                setting_row("ROM folders", "Creates a folder for every supported system.").child(
+                    Button::new("create-folders").label("Create").on_click(cx.listener(|view, _, _, cx| {
+                        view.message = match emu::create_folders(&view.config) {
+                            Ok(()) => format!("Created folders in {}", view.config.roms_dir.display()),
+                            Err(error) => error,
+                        };
+                        view.rescan(cx);
+                    })),
+                )
+            })
             .child(setting_row("RetroArch", "Installs with winget, Homebrew or Flatpak.").child(
                 Button::new("install-retroarch").label("Install").disabled(self.busy).on_click(cx.listener(|view, _, _, cx| {
                     view.run("Installing RetroArch…", |_| emu::install_retroarch().map(|()| "RetroArch installed.".into()), cx)

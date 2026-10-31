@@ -98,6 +98,12 @@ pub fn create_folders(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Shows a folder in Explorer, Finder or the Linux file manager.
+pub fn open_folder(dir: &Path) -> Result<(), String> {
+    let opener = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    Command::new(opener).arg(dir).spawn().map(|_| ()).map_err(|e| format!("Could not open {}: {e}", dir.display()))
+}
+
 pub fn scan(roms_dir: &Path, systems: &[System]) -> Vec<Game> {
     let mut games = Vec::new();
     for s in systems {
