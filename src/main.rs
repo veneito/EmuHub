@@ -2325,15 +2325,14 @@ impl Hub {
             let count = self.games.iter().filter(|g| g.system == system.id).count();
             let id = system.id.clone();
             systems_row = systems_row.child(
-                self.ring(div().id(("system", col)).w(px(150.)).h(px(110.)).flex_none().rounded_lg(), self.focus == Focus::Home(2, col))
+                self.ring(div().id(("system", col)).w(px(150.)).h(px(72.)).flex_none().rounded_lg(), self.focus == Focus::Home(2, col))
                     .cursor_pointer()
                     .bg(rgba(0xffffff0a))
                     .hover(|style| style.bg(rgba(0xffffff14)))
                     .p_3()
                     .flex()
                     .flex_col()
-                    .justify_between()
-                    .child(tile(&system.name, 36.))
+                    .justify_center()
                     .child(
                         div()
                             .flex()
