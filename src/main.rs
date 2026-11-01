@@ -298,6 +298,27 @@ impl Hub {
                     Ok(()) => "API key saved.".into(),
                     Err(error) => format!("Could not save API key: {error}"),
                 };
+                // SteamGridDB keys are 32 characters; check once it's all there rather than on every keystroke.
+                if view.config.steamgriddb_key.len() == 32 {
+                    let key = view.config.steamgriddb_key.clone();
+                    cx.spawn(async move |this, cx| {
+                        let checked = cx
+                            .background_executor()
+                            .spawn(async move { emu::check_steamgriddb_key(&key).inspect(|_| emu::forget_cover_misses()) })
+                            .await;
+                        let _ = this.update(cx, |view, cx| {
+                            match checked {
+                                Ok(()) => {
+                                    view.message = "SteamGridDB key works. Looking for missing covers.".into();
+                                    view.fetch_covers(cx);
+                                }
+                                Err(error) => view.message = error,
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
                 cx.notify();
             }
         })
@@ -425,9 +446,11 @@ impl Hub {
     }
 
     fn rescan(&mut self, cx: &mut Context<Self>) {
+        // Keep the selected game selected (and so its background) when it's still there.
+        let selected = self.selected.map(|i| self.games[i].path.clone());
         self.games = emu::scan(&self.config.roms_dir, &self.systems);
         self.refresh_covers();
-        self.selected = None;
+        self.selected = selected.and_then(|path| self.games.iter().position(|g| g.path == path));
         if self.system.as_deref().is_some_and(|s| s != FAVORITES && !self.games.iter().any(|g| g.system == s)) {
             self.system = None;
         }
@@ -1339,11 +1362,22 @@ impl Hub {
                                 if visible.len() == 1 { "" } else { "s" }
                             )))
                             .child(
-                                div().pt_2().child(
-                                    Button::new("rescan")
-                                        .label("Rescan")
-                                        .on_click(cx.listener(|view, _, _, cx| view.rescan(cx))),
-                                ),
+                                div()
+                                    .pt_2()
+                                    .flex()
+                                    .gap_2()
+                                    .child(Button::new("rescan").label("Rescan").on_click(cx.listener(|view, _, _, cx| view.rescan(cx))))
+                                    .child(Button::new("open-library").label("Open").on_click(cx.listener(|view, _, _, cx| {
+                                        // The system's ROM folder, or the whole ROM folder for All games and Favorites.
+                                        let dir = match view.system.as_deref() {
+                                            Some(id) if id != FAVORITES => view.config.roms_dir.join(id),
+                                            _ => view.config.roms_dir.clone(),
+                                        };
+                                        if let Err(error) = emu::open_folder(&dir) {
+                                            view.message = error;
+                                            cx.notify();
+                                        }
+                                    }))),
                             ),
                     ),
             )

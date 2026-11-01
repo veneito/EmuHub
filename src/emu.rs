@@ -303,6 +303,22 @@ impl Running {
     }
 }
 
+/// NES light-gun games. They run in FCEUmm instead of the system's core: it draws a crosshair
+/// for the Zapper (Mesen shows nothing to aim with), and port 2 is set to the Zapper.
+const ZAPPER_GAMES: &[&str] = &[
+    "duck hunt", "hogan's alley", "wild gunman", "gumshoe", "freedom force", "operation wolf",
+    "the adventures of bayou billy", "baby boomer", "barker bill's trick shooting", "chiller",
+    "mechanized attack", "shooting range", "to the earth", "lone ranger", "laser invasion", "track & field ii",
+];
+const ZAPPER_CORE: &str = "fceumm";
+/// FCEUmm's Zapper device: RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_MOUSE, 0).
+const ZAPPER_DEVICE: &str = "258";
+
+fn zapper_game(game: &Game) -> bool {
+    let name = game.name.to_lowercase();
+    game.system == "nes" && ZAPPER_GAMES.iter().any(|z| name.starts_with(z))
+}
+
 /// Starts a game in RetroArch or its standalone emulator.
 pub fn launch(cfg: &Config, game: &Game) -> Result<Running, String> {
     let sys = systems().into_iter().find(|s| s.id == game.system).ok_or("unknown system")?;
@@ -312,20 +328,30 @@ pub fn launch(cfg: &Config, game: &Game) -> Result<Running, String> {
         record_play(game);
         return Ok(running);
     }
-    let core = cfg.cores_dir.join(core_file(&sys.core));
+    let zapper = zapper_game(game);
+    let core = cfg.cores_dir.join(core_file(if zapper { ZAPPER_CORE } else { &sys.core }));
     if !core.exists() {
         return Err(format!("Core not found: {}. Use Settings → Install cores.", core.display()));
     }
-    let child = retroarch(cfg)?.arg("-L").arg(core).arg(&game.path).spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
+    let child = retroarch(cfg, zapper)?.arg("-L").arg(core).arg(&game.path).spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
     record_play(game);
     Ok(Running { child, close_on_combo: false, game: Some(game.path.clone()), started: std::time::Instant::now() })
 }
 
 /// RetroArch, fullscreen, with EmuHub's settings for this run (see retroarch_overrides).
-fn retroarch(cfg: &Config) -> Result<Command, String> {
+fn retroarch(cfg: &Config, zapper: bool) -> Result<Command, String> {
     let (exe, args) = cfg.retroarch_cmd.split_first().ok_or("RetroArch command is empty")?;
     let file = config_dir().join("retroarch-overrides.cfg");
-    write_atomic(&file, retroarch_overrides(&cfg.roms_dir).as_bytes())?;
+    // Always set port 2: RetroArch saves it on exit, and the Zapper's id means something else to other cores.
+    let mut port2 = format!("input_libretro_device_p2 = \"{}\"
+", if zapper { ZAPPER_DEVICE } else { "1" });
+    if zapper {
+        // Player 2 reads the trigger from mouse 1 by default, which doesn't exist with one mouse.
+        port2 += "input_player2_mouse_index = \"0\"
+input_player2_gun_trigger_mbtn = \"1\"
+";
+    }
+    write_atomic(&file, (retroarch_overrides(&cfg.roms_dir) + &port2).as_bytes())?;
     let mut command = start(Path::new(exe));
     command.args(args).arg("--fullscreen").arg("--appendconfig").arg(file);
     Ok(command)
@@ -569,6 +595,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Every core systems.json needs, without duplicates.
 fn needed_cores() -> Vec<String> {
     let mut cores: Vec<String> = systems().into_iter().map(|s| s.core).filter(|c| !c.is_empty()).collect();
+    cores.push(ZAPPER_CORE.to_owned());
     cores.sort();
     cores.dedup();
     cores
@@ -616,7 +643,7 @@ fn plist_version(plist: &str) -> Option<String> {
 
 /// Starts RetroArch on its own, e.g. to change its settings.
 pub fn open_retroarch(cfg: &Config) -> Result<Running, String> {
-    let child = retroarch(cfg)?.spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
+    let child = retroarch(cfg, false)?.spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
     Ok(Running { child, close_on_combo: false, game: None, started: std::time::Instant::now() })
 }
 
@@ -785,6 +812,26 @@ fn steamgrid_grids(key: &str, name: &str) -> Result<Vec<(String, String)>, Strin
         .flatten()
         .filter_map(|g| Some((g["thumb"].as_str()?.to_owned(), g["url"].as_str()?.to_owned())))
         .collect())
+}
+
+/// Asks SteamGridDB whether the key works, with a message fit to show the user if it doesn't.
+pub fn check_steamgriddb_key(key: &str) -> Result<(), String> {
+    match ureq::get("https://www.steamgriddb.com/api/v2/search/autocomplete/mario").set("Authorization", &format!("Bearer {key}")).call() {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(401, _)) => Err("SteamGridDB says this API key is invalid. Copy it again from steamgriddb.com → Preferences → API.".into()),
+        Err(error) => Err(format!("Could not reach SteamGridDB: {error}")),
+    }
+}
+
+/// Forgets which games had no cover, so they're looked up again (e.g. with a new SteamGridDB key).
+pub fn forget_cover_misses() {
+    for system in std::fs::read_dir(config_dir().join("covers")).into_iter().flatten().flatten() {
+        for file in std::fs::read_dir(system.path()).into_iter().flatten().flatten() {
+            if file.path().extension().is_some_and(|e| e == "nocover") {
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
+    }
 }
 
 /// Downloads a cover into the cache: libretro by exact name, then libretro's closest name, then SteamGridDB
@@ -1008,6 +1055,15 @@ mod tests {
         std::fs::write(dir.join("psx/Crash.chd"), b"").unwrap();
         let names: Vec<String> = scan(&dir, &systems()).into_iter().map(|g| g.name).collect();
         assert_eq!(names, ["Crash", "Final Fantasy VII"]);
+    }
+
+    #[test]
+    fn zapper_games_are_nes_light_gun_titles() {
+        let game = |name: &str, system: &str| Game { name: name.into(), system: system.into(), path: PathBuf::new() };
+        assert!(zapper_game(&game("Duck Hunt (World)", "nes")));
+        assert!(!zapper_game(&game("Duck Hunt (World)", "snes")));
+        assert!(!zapper_game(&game("Super Mario Bros. (World)", "nes")));
+        assert!(needed_cores().contains(&ZAPPER_CORE.to_owned()));
     }
 
     #[test]
