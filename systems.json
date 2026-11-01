@@ -16,5 +16,8 @@
   { "id": "psx",         "name": "PlayStation",      "exts": ["cue", "chd", "pbp", "m3u"],       "core": "swanstation",       "thumbs": "Sony - PlayStation" },
   { "id": "ps2",         "name": "PlayStation 2",    "exts": ["iso", "chd", "cso", "gz", "m3u"],  "standalone": "pcsx2",         "thumbs": "Sony - PlayStation 2" },
   { "id": "gc",          "name": "GameCube",         "exts": ["iso", "gcm", "rvz", "gcz", "ciso"], "standalone": "dolphin",       "thumbs": "Nintendo - GameCube" },
-  { "id": "wii",         "name": "Wii",              "exts": ["iso", "wbfs", "rvz", "gcz", "wad"], "standalone": "dolphin",       "thumbs": "Nintendo - Wii" }
+  { "id": "wii",         "name": "Wii",              "exts": ["iso", "wbfs", "rvz", "gcz", "wad"], "standalone": "dolphin",       "thumbs": "Nintendo - Wii" },
+  { "id": "psp",         "name": "PSP",              "exts": ["iso", "cso", "chd", "pbp"],          "standalone": "ppsspp",        "thumbs": "Sony - PlayStation Portable" },
+  { "id": "wiiu",        "name": "Wii U",            "exts": ["wua", "wud", "wux", "rpx"],          "standalone": "cemu",          "thumbs": "Nintendo - Wii U" },
+  { "id": "n3ds",        "name": "Nintendo 3DS",     "exts": ["3ds", "cci", "cxi", "3dsx"],         "standalone": "azahar",        "thumbs": "Nintendo - Nintendo 3DS" }
 ]

@@ -269,11 +269,24 @@ pub struct Running {
     child: std::process::Child,
     /// Standalone emulators are closed by EmuHub; RetroArch handles the combo itself (and saves first).
     close_on_combo: bool,
+    /// The game being played, for its play time; None when RetroArch was opened on its own.
+    game: Option<PathBuf>,
+    started: std::time::Instant,
 }
 
 impl Running {
     pub fn is_open(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Adds this session to the game's play time. Call once, after the emulator closed.
+    pub fn record_playtime(&self) {
+        if let Some(game) = &self.game {
+            let mut times = load_playtime();
+            *times.entry(game.clone()).or_default() += self.started.elapsed().as_secs();
+            // Best effort, like the history: a failed write only loses this session.
+            let _ = write_atomic(&config_dir().join("playtime.json"), &serde_json::to_vec(&times).unwrap());
+        }
     }
 
     /// Asks the emulator to close, like clicking its window's X (not a force-quit, so it can save).
@@ -294,7 +307,8 @@ impl Running {
 pub fn launch(cfg: &Config, game: &Game) -> Result<Running, String> {
     let sys = systems().into_iter().find(|s| s.id == game.system).ok_or("unknown system")?;
     if let Some(emu) = emulator(&sys.standalone) {
-        let running = launch_standalone(cfg, emu, game)?;
+        let mut running = launch_standalone(cfg, emu, game)?;
+        running.game = Some(game.path.clone());
         record_play(game);
         return Ok(running);
     }
@@ -304,7 +318,7 @@ pub fn launch(cfg: &Config, game: &Game) -> Result<Running, String> {
     }
     let child = retroarch(cfg)?.arg("-L").arg(core).arg(&game.path).spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
     record_play(game);
-    Ok(Running { child, close_on_combo: false })
+    Ok(Running { child, close_on_combo: false, game: Some(game.path.clone()), started: std::time::Instant::now() })
 }
 
 /// RetroArch, fullscreen, with EmuHub's settings for this run (see retroarch_overrides).
@@ -331,10 +345,13 @@ pub struct Emulator {
     args: &'static [&'static str],
 }
 
-pub const EMULATORS: [Emulator; 3] = [
+pub const EMULATORS: [Emulator; 6] = [
     Emulator { id: "eden", name: "Eden", site: "https://eden-emu.dev", exe: "eden", args: &["-f", "-g"] },
     Emulator { id: "pcsx2", name: "PCSX2", site: "https://pcsx2.net", exe: "pcsx2-qt", args: &["-batch", "-fullscreen", "--"] },
     Emulator { id: "dolphin", name: "Dolphin", site: "https://dolphin-emu.org", exe: "Dolphin", args: &["-b", "-e"] },
+    Emulator { id: "ppsspp", name: "PPSSPP", site: "https://www.ppsspp.org", exe: if cfg!(target_os = "windows") { "PPSSPPWindows64" } else { "PPSSPPSDL" }, args: &["--fullscreen"] },
+    Emulator { id: "cemu", name: "Cemu", site: "https://cemu.info", exe: "Cemu", args: &["-f", "-g"] },
+    Emulator { id: "azahar", name: "Azahar", site: "https://azahar-emu.org", exe: "azahar", args: &["-f"] },
 ];
 
 pub fn emulator(id: &str) -> Option<&'static Emulator> {
@@ -436,7 +453,7 @@ fn launch_standalone(cfg: &Config, emu: &Emulator, game: &Game) -> Result<Runnin
     // On macOS the child is `open -W` (it waits for the app), so closing it wouldn't close the emulator.
     // shortcut: the combo doesn't close macOS standalone emulators; quit the app by bundle id if needed.
     let mac_app = cfg!(target_os = "macos") && app_bundle(&exe).is_some();
-    Ok(Running { child, close_on_combo: !mac_app })
+    Ok(Running { child, close_on_combo: !mac_app, game: None, started: std::time::Instant::now() })
 }
 
 // ---- play history ----------------------------------------------------------
@@ -455,6 +472,21 @@ fn record_play(game: &Game) {
     history.insert(game.path.clone(), now());
     // Best effort: a failed write only loses the "Continue Playing" order.
     let _ = write_atomic(&config_dir().join("history.json"), &serde_json::to_vec(&history).unwrap());
+}
+
+/// Seconds played per game, keyed by its file path.
+pub fn load_playtime() -> std::collections::HashMap<PathBuf, u64> {
+    std::fs::read(config_dir().join("playtime.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// "2h 15m played", "40m played", "Under 1m played", or None if never played.
+pub fn playtime_text(secs: u64) -> Option<String> {
+    match (secs / 3600, secs / 60 % 60) {
+        _ if secs == 0 => None,
+        (0, 0) => Some("Under 1m played".into()),
+        (0, m) => Some(format!("{m}m played")),
+        (h, m) => Some(format!("{h}h {m}m played")),
+    }
 }
 
 /// Favorite games, by file path.
@@ -585,7 +617,7 @@ fn plist_version(plist: &str) -> Option<String> {
 /// Starts RetroArch on its own, e.g. to change its settings.
 pub fn open_retroarch(cfg: &Config) -> Result<Running, String> {
     let child = retroarch(cfg)?.spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
-    Ok(Running { child, close_on_combo: false })
+    Ok(Running { child, close_on_combo: false, game: None, started: std::time::Instant::now() })
 }
 
 /// Downloads every core systems.json needs that isn't already in cores_dir. Returns how many were installed.
@@ -834,13 +866,25 @@ pub fn cover_candidates(game: &Game, steamgriddb_key: &str) -> Vec<Candidate> {
 /// full-size box art is 5-10x bigger, which made every scroll decode megabytes per card.
 const COVER_WIDTH: u32 = 360;
 
-/// The image scaled down to COVER_WIDTH as PNG, or the original bytes if it's small or not an image.
+/// Whether a cover of this size isn't 2:3 (within 1%), the shape of every cover box.
+fn off_shape(w: u32, h: u32) -> bool {
+    (w as f32 * 1.5 - h as f32).abs() > h as f32 * 0.01
+}
+
+/// The image center-cropped to 2:3 and scaled down to COVER_WIDTH as PNG, or the original bytes if it
+/// already fits or is not an image. Cropped here because GPUI rounds an image's corners on its fitted
+/// size, so art that overflows its box would show square corners.
 fn shrink_cover(bytes: &[u8]) -> Vec<u8> {
-    let Ok(img) = image::load_from_memory(bytes) else { return bytes.to_vec() };
-    if img.width() <= COVER_WIDTH {
+    let Ok(mut img) = image::load_from_memory(bytes) else { return bytes.to_vec() };
+    let (w, h) = (img.width(), img.height());
+    if w <= COVER_WIDTH && !off_shape(w, h) {
         return bytes.to_vec();
     }
-    let small = img.resize(COVER_WIDTH, u32::MAX, image::imageops::FilterType::Triangle);
+    if off_shape(w, h) {
+        let (cw, ch) = if h * 2 > w * 3 { (w, w * 3 / 2) } else { (h * 2 / 3, h) };
+        img = img.crop_imm((w - cw) / 2, (h - ch) / 2, cw, ch);
+    }
+    let small = if img.width() > COVER_WIDTH { img.resize(COVER_WIDTH, u32::MAX, image::imageops::FilterType::Triangle) } else { img };
     let mut out = std::io::Cursor::new(Vec::new());
     match small.write_to(&mut out, image::ImageFormat::Png) {
         Ok(()) => out.into_inner(),
@@ -848,15 +892,30 @@ fn shrink_cover(bytes: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The cover's most colorful shade as 0xRRGGBB, for the ambient background: saturated pixels count more
+/// so a red logo beats a grey sky.
+pub fn cover_color(path: &Path) -> Option<u32> {
+    let small = image::open(path).ok()?.thumbnail(24, 36).to_rgb8();
+    let (mut sum, mut weight) = ([0f32; 3], 0f32);
+    for p in small.pixels() {
+        let [r, g, b] = p.0.map(f32::from);
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        let w = (max - min) / 255. * (max / 255.) + 0.01;
+        sum = [sum[0] + r * w, sum[1] + g * w, sum[2] + b * w];
+        weight += w;
+    }
+    let [r, g, b] = sum.map(|c| (c / weight) as u32);
+    Some(r << 16 | g << 8 | b)
+}
+
 /// Shrinks a cover saved by an older EmuHub in place. Cheap when it's already small: only the file size
 /// and image header are read, so this doesn't decode every big-but-narrow cover on each launch.
 pub fn shrink_cached_cover(path: &Path) {
-    let big = std::fs::metadata(path).is_ok_and(|m| m.len() > 150_000);
-    if big && image::image_dimensions(path).is_ok_and(|(w, _)| w > COVER_WIDTH) {
+    if image::image_dimensions(path).is_ok_and(|(w, h)| w > COVER_WIDTH || off_shape(w, h)) {
         if let Ok(bytes) = std::fs::read(path) {
-            let small = shrink_cover(&bytes);
-            if small.len() < bytes.len() {
-                let _ = write_atomic(path, &small);
+            let fixed = shrink_cover(&bytes);
+            if fixed != bytes {
+                let _ = write_atomic(path, &fixed);
             }
         }
     }
@@ -904,6 +963,24 @@ pub fn fetch_snap(game: &Game) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cover_color_prefers_the_colorful_part() {
+        let path = std::env::temp_dir().join("emuhub-color-test.png");
+        let img = image::RgbImage::from_fn(10, 10, |x, _| if x < 7 { image::Rgb([128, 128, 128]) } else { image::Rgb([230, 20, 20]) });
+        img.save(&path).unwrap();
+        let color = cover_color(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(color >> 16 > (color >> 8 & 0xff) + 60, "{color:06x} should be reddish");
+    }
+
+    #[test]
+    fn playtime_reads_in_hours_and_minutes() {
+        assert_eq!(playtime_text(0), None);
+        assert_eq!(playtime_text(19), Some("Under 1m played".into()));
+        assert_eq!(playtime_text(40 * 60), Some("40m played".into()));
+        assert_eq!(playtime_text(2 * 3600 + 15 * 60 + 30), Some("2h 15m played".into()));
+    }
 
     #[test]
     fn scan_matches_extensions_per_system() {
@@ -960,6 +1037,11 @@ mod tests {
         let small = image::load_from_memory(&shrink_cover(png.get_ref())).unwrap();
         assert_eq!((small.width(), small.height()), (360, 540));
         assert_eq!(shrink_cover(b"not an image"), b"not an image");
+        // Square art is cropped to the 2:3 cover shape.
+        let mut square = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(300, 300).write_to(&mut square, image::ImageFormat::Png).unwrap();
+        let cropped = image::load_from_memory(&shrink_cover(square.get_ref())).unwrap();
+        assert_eq!((cropped.width(), cropped.height()), (200, 300));
     }
 
     #[test]

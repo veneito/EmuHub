@@ -1,22 +1,32 @@
-use gpui::{Window, WindowBackgroundAppearance};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// What's behind the page for the game in view.
+#[derive(Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub enum Backdrop {
+    Solid,
+    /// The cover's main color, fading down the window.
+    Color,
+    /// The cover itself, faded.
+    Cover,
+}
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Appearance {
-    pub glass: bool,
-    pub tint: u8,
     pub surface: u32,
     pub accent: u32,
+    /// Square corners on game covers instead of rounded ones.
+    pub square_covers: bool,
+    pub backdrop: Backdrop,
 }
 impl Default for Appearance {
     fn default() -> Self {
         Self {
-            glass: cfg!(any(target_os = "windows", target_os = "macos")),
-            tint: 110,
             surface: 0x0c1417,
             accent: 0x92c8e5,
+            square_covers: false,
+            backdrop: Backdrop::Cover,
         }
     }
 }
@@ -29,7 +39,6 @@ impl Appearance {
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        settings.tint = settings.tint.clamp(25, 235);
         settings.surface &= 0xffffff;
         settings.accent &= 0xffffff;
         if !dark_surface(settings.surface) {
@@ -44,20 +53,13 @@ impl Appearance {
         std::fs::write(path, serde_json::to_vec_pretty(&self).unwrap())
             .map_err(|_| "Could not save appearance settings.".into())
     }
-    pub fn apply(self, window: &Window) {
-        window.set_background_appearance(if self.glass {
-            WindowBackgroundAppearance::Blurred
-        } else {
-            WindowBackgroundAppearance::Opaque
-        });
-    }
     pub fn fill(self, rgb: u32) -> gpui::Rgba {
         let mut tinted = 0;
         for shift in [16, 8, 0] {
             let channel = (((rgb >> shift) & 255) + 3 * ((self.surface >> shift) & 255)) / 4;
             tinted |= channel << shift;
         }
-        gpui::rgba((tinted << 8) | if self.glass { self.tint as u32 } else { 255 })
+        gpui::rgb(tinted)
     }
     pub fn apply_theme(self, cx: &mut gpui::App) {
         let colors = &mut gpui_component::Theme::global_mut(cx).colors;
@@ -92,11 +94,9 @@ mod tests {
     use super::*;
     #[test]
     fn appearance_defaults_and_partial_settings_are_valid() {
-        let settings: Appearance = serde_json::from_str(r#"{"glass":false}"#).unwrap();
-        assert!(!settings.glass);
-        assert_eq!(settings.tint, 110);
-        let saved = serde_json::to_vec(&Appearance::default()).unwrap();
-        assert_eq!(serde_json::from_slice::<Appearance>(&saved).unwrap().glass, Appearance::default().glass);
+        let settings: Appearance = serde_json::from_str(r#"{"accent":1}"#).unwrap();
+        assert_eq!(settings.accent, 1);
+        assert_eq!(settings.surface, Appearance::default().surface);
     }
     #[test]
     fn custom_colors_validate_and_old_settings_still_load() {
@@ -104,10 +104,6 @@ mod tests {
         assert!(!dark_surface(0xffffff));
         let previous: Appearance = serde_json::from_str(r#"{"glass":true,"tint":160}"#).unwrap();
         assert_eq!(previous.surface, Appearance::default().surface);
-        let solid = Appearance {
-            glass: false,
-            ..Default::default()
-        };
-        assert_eq!(solid.fill(0).a, 1.);
+        assert_eq!(previous.fill(0).a, 1.);
     }
 }

@@ -62,8 +62,9 @@ enum Setting {
     RomFolders,
     RetroArch,
     Cores,
-    Glass(bool),
     Palette(usize),
+    SquareCovers(bool),
+    Backdrop(appearance::Backdrop),
     /// Pick the program for emu::EMULATORS[i].
     PickEmulator(usize),
     /// Open emu::EMULATORS[i]'s official site.
@@ -110,9 +111,10 @@ fn setting_place(setting: Setting) -> (usize, usize) {
         Setting::RetroArch => (0, 2),
         Setting::Cores => (0, 3),
         Setting::EmulatorFolder(i) | Setting::PickEmulator(i) | Setting::EmulatorSite(i) => (1, i),
-        Setting::Glass(_) => (2, 0),
-        Setting::Palette(_) => (2, 1),
-        Setting::Update => (2, 2),
+        Setting::Palette(_) => (2, 0),
+        Setting::Backdrop(_) => (2, 1),
+        Setting::SquareCovers(_) => (2, 2),
+        Setting::Update => (2, 3),
     }
 }
 
@@ -122,8 +124,9 @@ fn settings_items() -> Vec<Setting> {
     for i in 0..emu::EMULATORS.len() {
         items.extend([Setting::EmulatorFolder(i), Setting::PickEmulator(i), Setting::EmulatorSite(i)]);
     }
-    items.extend([Setting::Glass(false), Setting::Glass(true)]);
     items.extend((0..PALETTES.len()).map(Setting::Palette));
+    items.extend([appearance::Backdrop::Solid, appearance::Backdrop::Color, appearance::Backdrop::Cover].map(Setting::Backdrop));
+    items.extend([Setting::SquareCovers(false), Setting::SquareCovers(true)]);
     items.push(Setting::Update);
     items
 }
@@ -169,6 +172,8 @@ struct Hub {
     visible_cache: Vec<usize>,
     /// Each game's cover file if it has one, parallel to `games`, so drawing never touches the disk.
     covers: Vec<Option<std::path::PathBuf>>,
+    /// Each cover's color for the ambient background; None while it's being worked out or if it can't be.
+    tints: std::collections::HashMap<std::path::PathBuf, Option<u32>>,
     /// Bumped on every rescan so an older cover download pass stops.
     cover_pass: usize,
     /// Horizontal scroll of the Home rows, so the controller's card stays in view.
@@ -178,8 +183,12 @@ struct Hub {
     settings_scroll: ScrollHandle,
     /// When each game was last played, for Continue Playing.
     history: std::collections::HashMap<std::path::PathBuf, u64>,
+    /// Seconds played per game.
+    playtime: std::collections::HashMap<std::path::PathBuf, u64>,
     favorites: std::collections::HashSet<std::path::PathBuf>,
     message: String,
+    /// The message shown as a toast and when it appeared, so it can fade away on its own.
+    toast: (String, std::time::Instant, usize),
     /// A newer release, once the startup check finds one, and the top-right popup's state.
     update: Option<update::Release>,
     update_state: UpdateState,
@@ -258,14 +267,19 @@ fn setting_row(title: &str, note: &str) -> Div {
         .child(text)
 }
 
+/// The Library filter for favorite games, used in place of a system id.
+const FAVORITES: &str = "favorites";
+
 fn system_name<'a>(systems: &'a [System], id: &'a str) -> &'a str {
+    if id == FAVORITES {
+        return "Favorites";
+    }
     systems.iter().find(|s| s.id == id).map_or(id, |s| s.name.as_str())
 }
 
 impl Hub {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let appearance = appearance::Appearance::load();
-        appearance.apply(window);
         appearance.apply_theme(cx);
         let config = Config::load();
         let mut field = |value: String| cx.new(|cx| InputState::new(window, cx).default_value(value));
@@ -314,6 +328,24 @@ impl Hub {
             }
         })
         .detach();
+        // Notices when a game closes (to add its play time) and hides old toasts.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+            let tick = |view: &mut Self, cx: &mut Context<Self>| {
+                if view.running.is_some() && !view.reap() {
+                    cx.notify();
+                }
+                // Messages still in progress ("Downloading cores…") stay until they're replaced.
+                if !view.message.is_empty() && !view.message.ends_with('…') && view.toast.1.elapsed().as_secs() >= 4 {
+                    view.message.clear();
+                    cx.notify();
+                }
+            };
+            if this.update(cx, tick).is_err() {
+                return;
+            }
+        })
+        .detach();
 
         let mut hub = Self {
             query,
@@ -340,13 +372,16 @@ impl Hub {
             grid_scroll: UniformListScrollHandle::new(),
             visible_cache: vec![],
             covers: vec![],
+            tints: Default::default(),
             cover_pass: 0,
             home_scroll: [ScrollHandle::new(), ScrollHandle::new(), ScrollHandle::new()],
             home_page_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
             history: emu::load_history(),
+            playtime: emu::load_playtime(),
             favorites: emu::load_favorites(),
             message: String::new(),
+            toast: (String::new(), std::time::Instant::now(), 0),
             update: None,
             update_state: UpdateState::Hidden,
             appearance,
@@ -380,7 +415,11 @@ impl Hub {
         (0..self.games.len())
             .filter(|&i| {
                 let g = &self.games[i];
-                self.system.as_deref().is_none_or(|s| s == g.system) && g.name.to_lowercase().contains(&query)
+                let in_view = match self.system.as_deref() {
+                    Some(FAVORITES) => self.favorites.contains(&g.path),
+                    other => other.is_none_or(|s| s == g.system),
+                };
+                in_view && g.name.to_lowercase().contains(&query)
             })
             .collect()
     }
@@ -389,7 +428,7 @@ impl Hub {
         self.games = emu::scan(&self.config.roms_dir, &self.systems);
         self.refresh_covers();
         self.selected = None;
-        if self.system.as_deref().is_some_and(|s| !self.games.iter().any(|g| g.system == s)) {
+        if self.system.as_deref().is_some_and(|s| s != FAVORITES && !self.games.iter().any(|g| g.system == s)) {
             self.system = None;
         }
         if self.games.is_empty() {
@@ -444,7 +483,7 @@ impl Hub {
                     return;
                 }
             }
-            // One-time cleanup of full-size covers from older versions; already-small ones are skipped by size.
+            // One-time cleanup of covers from older versions: full-size or not 2:3. Fixed ones are skipped after a header read.
             cx.background_executor().spawn(async move { cached.iter().for_each(|p| emu::shrink_cached_cover(p)) }).await;
             for game in recent {
                 let got = cx.background_executor().spawn(async move { emu::fetch_snap(&game) }).await;
@@ -458,13 +497,33 @@ impl Hub {
 
     /// True (and says so) while a game or RetroArch that EmuHub started is still open.
     fn game_running(&mut self) -> bool {
-        let open = self.running.as_mut().is_some_and(|r| r.is_open());
+        let open = self.reap();
         if open {
             self.message = "A game is already running. Close it first (Share + Options).".into();
-        } else {
-            self.running = None;
         }
         open
+    }
+
+    /// True while the started emulator is open; once it closes, records its play time and forgets it.
+    fn reap(&mut self) -> bool {
+        let open = self.running.as_mut().is_some_and(|r| r.is_open());
+        if let Some(running) = self.running.take_if(|_| !open) {
+            running.record_playtime();
+            self.playtime = emu::load_playtime();
+        }
+        open
+    }
+
+    /// "Last played 2 days ago" and "3h 10m played", each on its own line so neither gets cut off.
+    fn played_rows(&self, path: &std::path::Path) -> Div {
+        let row = |name: &str, text: String| div().flex().items_center().gap_2().text_color(rgb(MUTED)).child(icon(name, 16., rgb(MUTED))).child(text);
+        let last = self.history.get(path).map_or("Not played yet".into(), |&t| format!("Last played {}", emu::ago(t)));
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(row("history", last))
+            .children(self.playtime.get(path).and_then(|&s| emu::playtime_text(s)).map(|time| row("play", time)))
     }
 
     fn play(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -493,7 +552,7 @@ impl Hub {
 
     /// Side-menu entries in order: All games, each system that has games, Settings.
     fn menu(&self) -> Vec<MenuItem> {
-        let mut items = vec![MenuItem::Home, MenuItem::Library(None)];
+        let mut items = vec![MenuItem::Home, MenuItem::Library(None), MenuItem::Library(Some(FAVORITES.into()))];
         items.extend(
             self.systems
                 .iter()
@@ -516,7 +575,13 @@ impl Hub {
 
     fn show(&mut self, item: &MenuItem) {
         match item {
-            MenuItem::Home => self.view = View::Home,
+            MenuItem::Home => {
+                // The panel appears once a game is clicked on Home.
+                if self.view != View::Home {
+                    self.selected = None;
+                }
+                self.view = View::Home;
+            }
             MenuItem::Settings => self.settings_open = true,
             MenuItem::Library(system) => {
                 if self.view != View::Library || self.system != *system {
@@ -710,9 +775,9 @@ impl Hub {
         let game = &self.games[details.game];
         let cover = emu::cover_path(game);
         let art = if cover.exists() {
-            img(cover).size_full().object_fit(ObjectFit::Cover).into_any_element()
+            img(cover).size_full().rounded(self.cover_corners()).object_fit(ObjectFit::Cover).into_any_element()
         } else {
-            tile(&game.name, 160.).size_full().rounded_none().into_any_element()
+            tile(&game.name, 160.).size_full().rounded(self.cover_corners()).into_any_element()
         };
         let focused = |i: usize| details.focus == i;
         // Round icon buttons with a label underneath; Play is filled with the accent color.
@@ -747,7 +812,6 @@ impl Hub {
                     .child(div().text_xs().text_color(rgb(MUTED)).child(label)),
             );
         }
-        let played = self.history.get(&game.path).map(|&t| format!("Last played {}", emu::ago(t)));
 
         let mut panel = div()
             .id("details-panel")
@@ -763,7 +827,7 @@ impl Hub {
                     .flex()
                     .items_end()
                     .gap_10()
-                    .child(div().w(px(240.)).h(px(360.)).flex_none().rounded_lg().overflow_hidden().shadow_lg().child(art))
+                    .child(div().w(px(240.)).h(px(360.)).flex_none().rounded(self.cover_corners()).overflow_hidden().shadow_lg().child(art))
                     .child(
                         div()
                             .flex_1()
@@ -773,7 +837,7 @@ impl Hub {
                             .gap_2()
                             .child(heading(system_name(&self.systems, &game.system)))
                             .child(div().text_size(px(40.)).font_weight(FontWeight::SEMIBOLD).child(game.name.clone()))
-                            .children(played.map(|p| div().flex().items_center().gap_2().text_color(rgb(MUTED)).child(icon("history", 16., rgb(MUTED))).child(p)))
+                            .child(self.played_rows(&game.path))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(game.path.display().to_string()))
                             .child(buttons),
                     ),
@@ -824,8 +888,8 @@ impl Hub {
             .flex_1()
             .min_h_0()
             .overflow_hidden()
-            .bg(appearance::Appearance { glass: false, ..self.appearance }.fill(0x101e23))
-            .when(cover.exists(), |d| {
+            .bg(self.appearance.fill(0x101e23))
+            .when(self.appearance.backdrop == appearance::Backdrop::Cover && cover.exists(), |d| {
                 d.child(div().absolute().top_0().left_0().size_full().opacity(0.12).child(img(cover).size_full().object_fit(ObjectFit::Cover)))
             })
             .child(panel)
@@ -910,10 +974,6 @@ impl Hub {
                     self.run("Downloading cores…", |config| emu::install_cores(&config).map(|n| format!("Installed {n} new cores.")), cx)
                 }
             }
-            Setting::Glass(glass) => {
-                self.appearance.glass = glass;
-                self.save_appearance(window, cx);
-            }
             Setting::PickEmulator(i) => {
                 let emulator = &emu::EMULATORS[i];
                 let picked = cx.prompt_for_paths(PathPromptOptions {
@@ -950,13 +1010,26 @@ impl Hub {
                 let (_, surface, accent) = PALETTES[i];
                 self.appearance.surface = surface;
                 self.appearance.accent = accent;
-                self.save_appearance(window, cx);
+                self.save_appearance(cx);
+            }
+            Setting::Backdrop(backdrop) => {
+                self.appearance.backdrop = backdrop;
+                self.save_appearance(cx);
+            }
+            Setting::SquareCovers(square) => {
+                self.appearance.square_covers = square;
+                self.save_appearance(cx);
             }
         }
         cx.notify();
     }
 
     /// Accent outline around whatever the controller is on.
+    /// Corner radius for game covers, from Settings → Appearance.
+    fn cover_corners(&self) -> Pixels {
+        px(if self.appearance.square_covers { 0. } else { 8. })
+    }
+
     fn ring<E: Styled>(&self, element: E, on: bool) -> E {
         let color: Hsla = if on && self.pad_used { rgb(self.appearance.accent).into() } else { rgba(0x00000000).into() };
         element.border_2().border_color(color)
@@ -1068,8 +1141,7 @@ impl Hub {
                 .rounded_lg()
                 .border_1()
                 .border_color(rgb(self.appearance.accent))
-                // Solid even in Glass mode so the page doesn't show through the text.
-                .bg(appearance::Appearance { glass: false, ..self.appearance }.fill(0x101e23))
+                .bg(self.appearance.fill(0x101e23))
                 .shadow_lg()
                 .occlude()
                 .child(
@@ -1168,8 +1240,20 @@ impl Hub {
                         cx.notify();
                     })),
             )
+            .child({
+                let favorites = self.view == View::Library && self.system.as_deref() == Some(FAVORITES);
+                self.ring(self.nav_row("nav-favorites", favorites), focused(2))
+                    .child(icon(if favorites { "heart-filled" } else { "heart" }, 18., tone(favorites)))
+                    .child(div().flex_1().child("Favorites"))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(self.favorites.len().to_string()))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.view = View::Library;
+                        view.system = Some(FAVORITES.into());
+                        cx.notify();
+                    }))
+            })
             .child(div().px_3().pt_3().pb_1().child(heading("Your Library")));
-        let mut row = 1;
+        let mut row = 2;
         for system in &self.systems {
             let count = self.games.iter().filter(|g| g.system == system.id).count();
             if count == 0 {
@@ -1275,12 +1359,11 @@ impl Hub {
         };
         let game = &self.games[index];
         let favorite = self.favorites.contains(&game.path);
-        let played = self.history.get(&game.path).map_or("Not played yet".into(), |&t| format!("Last played {}", emu::ago(t)));
         panel
-            .child(div().w(px(200.)).h(px(300.)).flex_none().rounded_lg().overflow_hidden().shadow_lg().child(self.cover(index, 200.)))
+            .child(div().w(px(200.)).h(px(300.)).flex_none().rounded(self.cover_corners()).overflow_hidden().shadow_lg().child(self.cover(index, 200.)))
             .child(heading(system_name(&self.systems, &game.system)))
             .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).line_clamp(3).child(game.name.clone()))
-            .child(div().flex().items_center().gap_2().text_color(rgb(MUTED)).child(icon("history", 16., rgb(MUTED))).child(played))
+            .child(self.played_rows(&game.path))
             .child(
                 div()
                     .flex()
@@ -1381,14 +1464,6 @@ impl Hub {
             );
         }
 
-        let mut modes = div().flex().gap_2();
-        for (label, glass) in [("Solid", false), ("Glass", true)] {
-            modes = modes.child(self.setting_button(
-                Setting::Glass(glass),
-                Button::new(label).label(label).selected(self.appearance.glass == glass),
-                cx,
-            ));
-        }
         let mut palettes = div().flex().flex_wrap().justify_end().gap_2();
         for (i, (name, surface, _)) in PALETTES.into_iter().enumerate() {
             palettes = palettes.child(self.setting_button(
@@ -1397,9 +1472,26 @@ impl Hub {
                 cx,
             ));
         }
+        let mut corners = div().flex().gap_2();
+        for (label, square) in [("Rounded", false), ("Square", true)] {
+            corners = corners.child(self.setting_button(
+                Setting::SquareCovers(square),
+                Button::new(label).label(label).selected(self.appearance.square_covers == square),
+                cx,
+            ));
+        }
+        let mut backdrops = div().flex().gap_2();
+        for (label, backdrop) in [("Solid", appearance::Backdrop::Solid), ("Color", appearance::Backdrop::Color), ("Cover", appearance::Backdrop::Cover)] {
+            backdrops = backdrops.child(self.setting_button(
+                Setting::Backdrop(backdrop),
+                Button::new(label).label(label).selected(self.appearance.backdrop == backdrop),
+                cx,
+            ));
+        }
         let looks = card()
-            .child(setting_row("Window material", "Glass blurs the desktop behind the window (Windows and macOS).").child(modes))
             .child(setting_row("Theme", "Preset colors for the whole window.").child(palettes))
+            .child(setting_row("Background", "Behind the game in view: plain, its cover's color, or its faded cover.").child(backdrops))
+            .child(setting_row("Cover corners", "Rounded or square game covers.").child(corners))
             .child(setting_row(
                 &format!("EmuHub {}", env!("CARGO_PKG_VERSION")),
                 &match &self.update {
@@ -1451,7 +1543,7 @@ impl Hub {
                     }))),
             )
             .child(div().flex_1().min_h_0().child(body.id("settings-card").max_h_full().overflow_y_scroll().track_scroll(&self.settings_scroll)));
-        // Dims the page behind; solid even in Glass mode so the page doesn't show through the text.
+        // Dims the page behind.
         div()
             .absolute()
             .top_0()
@@ -1473,15 +1565,14 @@ impl Hub {
                     .overflow_hidden()
                     .border_1()
                     .border_color(rgba(0xffffff1f))
-                    .bg(appearance::Appearance { glass: false, ..self.appearance }.fill(0x0c1417))
+                    .bg(self.appearance.fill(0x0c1417))
                     .shadow_lg()
                     .child(categories)
                     .child(content),
             )
     }
 
-    fn save_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.appearance.apply(window);
+    fn save_appearance(&mut self, cx: &mut Context<Self>) {
         self.appearance.apply_theme(cx);
         self.message = match self.appearance.save() {
             Ok(()) => "Appearance saved.".into(),
@@ -1493,6 +1584,39 @@ impl Hub {
     // ---- home -------------------------------------------------------------
 
     /// Played games, most recent first (the Continue Playing row).
+    /// The color of the game in view (game page, selected game, or Home's hero), working it out in the background once.
+    /// The cover of the game in view: game page, selected game, or Home's hero.
+    fn ambient_cover(&self) -> Option<std::path::PathBuf> {
+        let index = match (&self.details, self.selected, self.view, self.focus) {
+            (Some(d), ..) => d.game,
+            (None, Some(i), ..) => i,
+            (None, None, View::Home, Focus::Home(0, c)) => *self.recent().get(c)?,
+            (None, None, View::Home, Focus::Home(1, c)) => *self.favorite_games().get(c)?,
+            (None, None, View::Home, _) => *self.recent().first()?,
+            _ => return None,
+        };
+        self.covers.get(index)?.clone()
+    }
+
+    /// The color of the game in view, working it out in the background once.
+    fn ambient_tint(&mut self, cx: &mut Context<Self>) -> Option<u32> {
+        let cover = self.ambient_cover()?;
+        if let Some(&tint) = self.tints.get(&cover) {
+            return tint;
+        }
+        self.tints.insert(cover.clone(), None);
+        cx.spawn(async move |this, cx| {
+            let path = cover.clone();
+            let tint = cx.background_executor().spawn(async move { emu::cover_color(&path) }).await;
+            let _ = this.update(cx, |view, cx| {
+                view.tints.insert(cover, tint);
+                cx.notify();
+            });
+        })
+        .detach();
+        None
+    }
+
     fn recent(&self) -> Vec<usize> {
         let mut played: Vec<(u64, usize)> =
             self.games.iter().enumerate().filter_map(|(i, g)| self.history.get(&g.path).map(|&t| (t, i))).collect();
@@ -1587,8 +1711,9 @@ impl Hub {
     /// Cover art, or the letter tile when there isn't any yet.
     fn cover(&self, index: usize, size: f32) -> AnyElement {
         match &self.covers[index] {
-            Some(cover) => img(cover.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
-            None => tile(&self.games[index].name, size).size_full().rounded_none().into_any_element(),
+            // overflow_hidden doesn't clip to rounded corners in GPUI, so the image is rounded itself.
+            Some(cover) => img(cover.clone()).size_full().rounded(self.cover_corners()).object_fit(ObjectFit::Cover).into_any_element(),
+            None => tile(&self.games[index].name, size).size_full().rounded(self.cover_corners()).into_any_element(),
         }
     }
 
@@ -1629,7 +1754,7 @@ impl Hub {
                             .w(px(150.))
                             .h(px(225.))
                             .flex_none()
-                            .rounded_lg()
+                            .rounded(self.cover_corners())
                             .overflow_hidden()
                             .border_2()
                             // Bright when the controller is in the grid, dim while it's in the side menu.
@@ -1652,7 +1777,7 @@ impl Hub {
         let mut cards = div().id(("game-row", row)).flex().gap_4().px_6().pb_2().overflow_x_scroll().track_scroll(&self.home_scroll[row]);
         for (col, &index) in games.iter().enumerate() {
             cards = cards.child(
-                self.ring(div().id(("home-game", row * 100_000 + col)).w(px(120.)).h(px(180.)).flex_none().rounded_lg().overflow_hidden(), self.focus == Focus::Home(row, col))
+                self.ring(div().id(("home-game", row * 100_000 + col)).w(px(120.)).h(px(180.)).flex_none().rounded(self.cover_corners()).overflow_hidden(), self.focus == Focus::Home(row, col))
                     .cursor_pointer()
                     .bg(rgba(0xffffff0a))
                     .child(self.cover(index, 120.))
@@ -1699,7 +1824,7 @@ impl Hub {
                 .items_center()
                 .justify_center()
                 .bg(rgba(0x00000040))
-                .child(div().w(px(180.)).h(px(270.)).rounded_lg().overflow_hidden().child(self.cover(hero_index.unwrap(), 180.)))
+                .child(div().w(px(180.)).h(px(270.)).rounded(self.cover_corners()).overflow_hidden().child(self.cover(hero_index.unwrap(), 180.)))
                 .into_any_element(),
             None => img("banner.png").size_full().object_fit(ObjectFit::Cover).into_any_element(),
         };
@@ -1721,6 +1846,9 @@ impl Hub {
                             .child(icon("history", 16., rgb(MUTED)))
                             .child(self.history.get(&game.path).map_or("Not played yet".into(), |&t| emu::ago(t))),
                     )
+                    .children(self.playtime.get(&game.path).and_then(|&s| emu::playtime_text(s)).map(|time| {
+                        div().flex().items_center().gap_2().child(icon("play", 16., rgb(MUTED))).child(time)
+                    }))
                     .child(
                         div()
                             .flex()
@@ -1848,25 +1976,6 @@ impl Hub {
     }
 
     fn bottom_bar(&self) -> Div {
-        let focus = self.selected.map(|i| &self.games[i]);
-        let left = match focus {
-            Some(game) => div()
-                .w(px(300.))
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(tile(&game.name, 44.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(div().truncate().text_size(px(15.)).child(game.name.clone()))
-                        .child(div().truncate().text_xs().text_color(rgb(MUTED)).child(system_name(&self.systems, &game.system).to_owned())),
-                ),
-            None => div().w(px(300.)).text_color(rgb(MUTED)).child("Nothing selected"),
-        };
         div()
             .h(px(76.))
             .flex_shrink_0()
@@ -1877,18 +1986,69 @@ impl Hub {
             .flex()
             .items_center()
             .gap_4()
-            .child(left)
+            // Same width as the message on the right, so the hints stay centered.
+            .child(div().w(px(300.)))
             .child(self.hint_bar())
-            .child(div().w(px(300.)).text_xs().text_right().text_color(rgb(MUTED)).child(if self.message.is_empty() {
-                format!("{} games", self.games.len())
-            } else {
-                self.message.clone()
-            }))
+            .child(div().w(px(300.)).text_xs().text_right().text_color(rgb(MUTED)).child(format!("{} games", self.games.len())))
+    }
+
+    /// The latest message as a card above the bottom bar's right end, sliding up as it appears,
+    /// sized and styled like Sonora's (Sonner-style) toasts.
+    fn toast(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.toast.0 != self.message {
+            self.toast = (self.message.clone(), std::time::Instant::now(), self.toast.2 + 1);
+        }
+        if self.message.is_empty() {
+            return None;
+        }
+        let close = div()
+            .id("toast-close")
+            .flex_none()
+            .p_1()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|d| d.bg(rgba(0xffffff14)))
+            .child(icon("btn-cross", 14., rgb(MUTED)))
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.message.clear();
+                cx.notify();
+            }));
+        let card = div()
+            .absolute()
+            .bottom(px(76. + 14.))
+            .right(px(14.))
+            .w(px(364.))
+            .flex()
+            .items_center()
+            .gap_3()
+            .pl_4()
+            .pr_2()
+            .py_3()
+            .rounded_lg()
+            .bg(self.appearance.fill(0x101e23))
+            .border_1()
+            .border_color(rgba(0xffffff1f))
+            .shadow_lg()
+            .child(div().flex_1().min_w_0().child(self.message.clone()))
+            .child(close);
+        Some(
+            card.with_animation(("toast", self.toast.2), Animation::new(std::time::Duration::from_millis(400)).with_easing(ease_out_quint()), |card, t| {
+                card.bottom(px(76. + 14. - 16. * (1. - t))).opacity(t)
+            })
+            .into_any_element(),
+        )
     }
 }
 
 impl Render for Hub {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let toast = self.toast(cx);
+        let (tint, backdrop_cover) = match self.appearance.backdrop {
+            appearance::Backdrop::Solid => (None, None),
+            appearance::Backdrop::Color => (self.ambient_tint(cx), None),
+            // The game page draws its own faded cover.
+            appearance::Backdrop::Cover => (None, self.ambient_cover().filter(|_| self.details.is_none())),
+        };
         let on_page = match self.focus {
             Focus::Menu(i) => i < self.menu().len(),
             Focus::Grid => self.view == View::Library,
@@ -1908,6 +2068,7 @@ impl Render for Hub {
         let visible = self.visible(cx);
         self.visible_cache = visible.clone();
         let page = match self.view {
+            View::Home if self.selected.is_some() => div().id("home-split").size_full().flex().child(self.home_page(cx).flex_1().min_w_0()).child(self.game_panel(cx)),
             View::Home => self.home_page(cx),
             View::Library => div().id("library-split").size_full().flex().child(self.library_page(&visible, cx).flex_1().min_w_0()).child(self.game_panel(cx)),
         };
@@ -1931,7 +2092,12 @@ impl Render for Hub {
             .size_full()
             .flex()
             .flex_col()
-            .bg(if self.appearance.glass { rgba(0x00000000) } else { self.appearance.fill(0x081012) })
+            .bg(self.appearance.fill(0x081012))
+            // Ambient light from the game in view, fading down the window; drawn first so it stays behind.
+            .children(tint.map(|color| {
+                div().absolute().inset_0().bg(linear_gradient(180., linear_color_stop(rgba(color << 8 | 0x99), 0.), linear_color_stop(rgba(color << 8), 0.9)))
+            }))
+            .children(backdrop_cover.map(|cover| div().absolute().inset_0().opacity(0.12).child(img(cover).size_full().object_fit(ObjectFit::Cover))))
             .font_family(FONT)
             .text_sm()
             .text_color(rgb(TEXT))
@@ -1940,6 +2106,8 @@ impl Render for Hub {
                     div().flex_1().flex().items_center().gap_2().child(
                         div()
                             .id("toggle-sidebar")
+                            // Keeps the title bar's drag area from taking the click on Windows.
+                            .occlude()
                             .w(px(32.))
                             .h(px(32.))
                             .rounded_md()
@@ -1954,6 +2122,28 @@ impl Render for Hub {
                                 cx.notify();
                             })),
                     )
+                    .child(
+                        div()
+                            .id("rescan")
+                            // Keeps the title bar's drag area from taking the click on Windows.
+                            .occlude()
+                            .w(px(32.))
+                            .h(px(32.))
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgba(0xffffff1a)))
+                            .child(icon("refresh", 16., rgb(MUTED)))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.rescan(cx);
+                                if !view.games.is_empty() {
+                                    view.message = format!("Found {} games.", view.games.len());
+                                }
+                                cx.notify();
+                            })),
+                    )
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("EmuHub")),
                 ),
             )
@@ -1962,6 +2152,7 @@ impl Render for Hub {
                 None => body.into_any_element(),
             })
             .child(self.bottom_bar())
+            .children(toast)
             .when(self.settings_open && self.details.is_none(), |d| d.child(self.settings_popup(cx)))
             .children(self.update_popup(cx))
     }
@@ -1976,7 +2167,7 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1240.), px(800.)), cx);
         cx.open_window(
             WindowOptions {
-                window_background: WindowBackgroundAppearance::Transparent,
+                window_background: WindowBackgroundAppearance::Opaque,
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(860.), px(560.))),
                 // Matches emuhub.desktop, so Linux taskbars show the AppImage's icon.
