@@ -19,6 +19,15 @@ pub struct System {
     pub standalone: String,
     /// Folder name on thumbnails.libretro.com.
     pub thumbs: String,
+    /// BIOS files the core needs, relative to Emulation/bios.
+    #[serde(default)]
+    pub bios: Vec<String>,
+}
+
+/// The system's BIOS files that aren't in Emulation/bios.
+pub fn missing_bios<'a>(cfg: &Config, system: &'a System) -> Vec<&'a str> {
+    let bios = emulation_dir(cfg).join("bios");
+    system.bios.iter().filter(|f| !bios.join(f).is_file()).map(String::as_str).collect()
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -371,13 +380,16 @@ pub struct Emulator {
     args: &'static [&'static str],
 }
 
-pub const EMULATORS: [Emulator; 6] = [
+pub const EMULATORS: [Emulator; 8] = [
     Emulator { id: "eden", name: "Eden", site: "https://eden-emu.dev", exe: "eden", args: &["-f", "-g"] },
     Emulator { id: "pcsx2", name: "PCSX2", site: "https://pcsx2.net", exe: "pcsx2-qt", args: &["-batch", "-fullscreen", "--"] },
     Emulator { id: "dolphin", name: "Dolphin", site: "https://dolphin-emu.org", exe: "Dolphin", args: &["-b", "-e"] },
     Emulator { id: "ppsspp", name: "PPSSPP", site: "https://www.ppsspp.org", exe: if cfg!(target_os = "windows") { "PPSSPPWindows64" } else { "PPSSPPSDL" }, args: &["--fullscreen"] },
     Emulator { id: "cemu", name: "Cemu", site: "https://cemu.info", exe: "Cemu", args: &["-f", "-g"] },
     Emulator { id: "azahar", name: "Azahar", site: "https://azahar-emu.org", exe: "azahar", args: &["-f"] },
+    Emulator { id: "xemu", name: "xemu", site: "https://xemu.app", exe: "xemu", args: &["-full-screen", "-dvd_path"] },
+    // shortcut: only .iso games; installed folder games (PS3_GAME/USRDIR/EBOOT.BIN) need their own scan case.
+    Emulator { id: "rpcs3", name: "RPCS3", site: "https://rpcs3.net", exe: "rpcs3", args: &["--no-gui"] },
 ];
 
 pub fn emulator(id: &str) -> Option<&'static Emulator> {
@@ -593,7 +605,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Every core systems.json needs, without duplicates.
-fn needed_cores() -> Vec<String> {
+pub fn needed_cores() -> Vec<String> {
     let mut cores: Vec<String> = systems().into_iter().map(|s| s.core).filter(|c| !c.is_empty()).collect();
     cores.push(ZAPPER_CORE.to_owned());
     cores.sort();
@@ -604,8 +616,12 @@ fn needed_cores() -> Vec<String> {
 /// Returns (missing, total) core counts for the Settings page.
 pub fn core_status(cfg: &Config) -> (usize, usize) {
     let cores = needed_cores();
-    let missing = cores.iter().filter(|c| !cfg.cores_dir.join(core_file(c)).exists()).count();
+    let missing = cores.iter().filter(|c| !core_installed(cfg, c)).count();
     (missing, cores.len())
+}
+
+pub fn core_installed(cfg: &Config, core: &str) -> bool {
+    cfg.cores_dir.join(core_file(core)).exists()
 }
 
 /// Whether the configured RetroArch command points at something installed.
@@ -651,21 +667,25 @@ pub fn open_retroarch(cfg: &Config) -> Result<Running, String> {
 pub fn install_cores(cfg: &Config) -> Result<usize, String> {
     let mut installed = 0;
     for core in needed_cores() {
-        let file = core_file(&core);
-        if cfg.cores_dir.join(&file).exists() {
-            continue;
+        if !core_installed(cfg, &core) {
+            install_core(cfg, &core)?;
+            installed += 1;
         }
-        let url = format!("https://buildbot.libretro.com/nightly/{}/latest/{file}.zip", buildbot_platform());
-        let bytes = download(&url, None).map_err(|e| format!("{core}: {e}"))?;
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("{core}: {e}"))?;
-        // Only extract the expected core file, never paths from inside the archive.
-        let mut entry = zip.by_name(&file).map_err(|e| format!("{core}: {e}"))?;
-        let mut data = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| e.to_string())?;
-        write_atomic(&cfg.cores_dir.join(&file), &data)?;
-        installed += 1;
     }
     Ok(installed)
+}
+
+/// Downloads one core from the libretro buildbot, replacing any copy already there.
+pub fn install_core(cfg: &Config, core: &str) -> Result<(), String> {
+    let file = core_file(core);
+    let url = format!("https://buildbot.libretro.com/nightly/{}/latest/{file}.zip", buildbot_platform());
+    let bytes = download(&url, None).map_err(|e| format!("{core}: {e}"))?;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("{core}: {e}"))?;
+    // Only extract the expected core file, never paths from inside the archive.
+    let mut entry = zip.by_name(&file).map_err(|e| format!("{core}: {e}"))?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut data).map_err(|e| e.to_string())?;
+    write_atomic(&cfg.cores_dir.join(&file), &data)
 }
 
 /// Installs RetroArch with the OS package manager; each lands where default_config expects it.

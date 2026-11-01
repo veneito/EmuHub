@@ -63,7 +63,12 @@ enum Setting {
     EmulationFolder,
     RomFolders,
     RetroArch,
+    /// Install every missing core.
     Cores,
+    /// Show the Cores category.
+    CoreList,
+    /// Install or reinstall CORES[i].
+    Core(usize),
     Palette(usize),
     SquareCovers(bool),
     Backdrop(appearance::Backdrop),
@@ -111,7 +116,10 @@ enum LibRow {
 }
 
 /// The Settings popup's categories; Paths needs a keyboard, so it has no controller buttons.
-const SETTING_CATEGORIES: [&str; 4] = ["Setup", "Emulators", "Appearance", "Paths"];
+const SETTING_CATEGORIES: [&str; 5] = ["Setup", "Cores", "Emulators", "Appearance", "Paths"];
+
+/// emu::needed_cores(), parsed once: settings_items() runs for every Settings button drawn.
+static CORES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(emu::needed_cores);
 
 /// (category, row in that category's card) of a Settings button.
 fn setting_place(setting: Setting) -> (usize, usize) {
@@ -119,18 +127,20 @@ fn setting_place(setting: Setting) -> (usize, usize) {
         Setting::EmulationFolder => (0, 0),
         Setting::RomFolders => (0, 1),
         Setting::RetroArch => (0, 2),
-        Setting::Cores => (0, 3),
-        Setting::EmulatorFolder(i) | Setting::PickEmulator(i) | Setting::EmulatorSite(i) => (1, i),
-        Setting::Palette(_) => (2, 0),
-        Setting::Backdrop(_) => (2, 1),
-        Setting::SquareCovers(_) => (2, 2),
-        Setting::Update => (2, 3),
+        Setting::CoreList | Setting::Cores => (0, 3),
+        Setting::Core(i) => (1, i),
+        Setting::EmulatorFolder(i) | Setting::PickEmulator(i) | Setting::EmulatorSite(i) => (2, i),
+        Setting::Palette(_) => (3, 0),
+        Setting::Backdrop(_) => (3, 1),
+        Setting::SquareCovers(_) => (3, 2),
+        Setting::Update => (3, 3),
     }
 }
 
-/// The Settings buttons a controller can reach, in on-screen order: Setup, Emulators, Appearance.
+/// The Settings buttons a controller can reach, in on-screen order: Setup, Cores, Emulators, Appearance.
 fn settings_items() -> Vec<Setting> {
-    let mut items = vec![Setting::EmulationFolder, Setting::RomFolders, Setting::RetroArch, Setting::Cores];
+    let mut items = vec![Setting::EmulationFolder, Setting::RomFolders, Setting::RetroArch, Setting::CoreList, Setting::Cores];
+    items.extend((0..CORES.len()).map(Setting::Core));
     for i in 0..emu::EMULATORS.len() {
         items.extend([Setting::EmulatorFolder(i), Setting::PickEmulator(i), Setting::EmulatorSite(i)]);
     }
@@ -279,6 +289,8 @@ fn setting_row(title: &str, note: &str) -> Div {
     }
     div()
         .flex()
+        // Keep full height so a long card scrolls instead of squeezing its rows.
+        .flex_none()
         .items_center()
         .justify_between()
         .gap_6()
@@ -1123,6 +1135,17 @@ impl Hub {
                     self.run("Downloading cores…", |config| emu::install_cores(&config).map(|n| format!("Installed {n} new cores.")), cx)
                 }
             }
+            Setting::CoreList => {
+                self.settings_cat = 1;
+                self.settings_scroll.scroll_to_item(0);
+                if let Some(j) = settings_items().iter().position(|&s| setting_place(s).0 == 1) {
+                    self.focus = Focus::Settings(j);
+                }
+            }
+            Setting::Core(i) => {
+                let core = CORES[i].clone();
+                self.run(&format!("Downloading {core}…"), move |config| emu::install_core(&config, &core).map(|()| format!("Installed {core}.")), cx)
+            }
             Setting::PickEmulator(i) => {
                 let emulator = &emu::EMULATORS[i];
                 let picked = cx.prompt_for_paths(PathPromptOptions {
@@ -1653,6 +1676,16 @@ impl Hub {
         let retroarch = emu::retroarch_installed(&self.config);
         let retroarch_warning = emu::retroarch_version_warning(&self.config);
         let (missing, total) = emu::core_status(&self.config);
+        // Only systems with games, so empty EmuDeck folders don't fill the list.
+        let missing_bios: Vec<String> = self
+            .systems
+            .iter()
+            .filter(|s| self.games.iter().any(|g| g.system == s.id))
+            .filter_map(|s| {
+                let files = emu::missing_bios(&self.config, s);
+                (!files.is_empty()).then(|| format!("{} ({})", s.name, files.join(", ")))
+            })
+            .collect();
         let setup = card()
             .child(
                 setting_row(
@@ -1696,12 +1729,44 @@ impl Hub {
                         format!("{missing} of {total} cores missing. Downloads them from libretro.")
                     },
                 )
-                .child(self.setting_button(
-                    Setting::Cores,
-                    Button::new("cores").label(if missing == 0 { "Installed" } else { "Install" }).disabled(self.busy || missing == 0),
-                    cx,
-                )),
-            );
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(self.setting_button(Setting::CoreList, Button::new("core-list").label("Open list"), cx))
+                        .child(self.setting_button(
+                            Setting::Cores,
+                            Button::new("cores").label(if missing == 0 { "All installed" } else { "Install all" }).disabled(self.busy || missing == 0),
+                            cx,
+                        )),
+                ),
+            )
+            .child(setting_row(
+                "BIOS files",
+                &if missing_bios.is_empty() {
+                    "Every system with games has its BIOS files.".to_owned()
+                } else {
+                    format!("Missing in {}: {}", emu::emulation_folder(&self.config).join("bios").display(), missing_bios.join("; "))
+                },
+            ));
+
+        let mut cores = card();
+        for (i, core) in CORES.iter().enumerate() {
+            let systems: Vec<&str> = self.systems.iter().filter(|s| &s.core == core).map(|s| s.name.as_str()).collect();
+            let installed = emu::core_installed(&self.config, core);
+            let note = match (installed, systems.is_empty()) {
+                (true, false) => format!("Installed. {}", systems.join(", ")),
+                (false, false) => format!("Not installed. {}", systems.join(", ")),
+                // The Zapper core isn't any system's main core.
+                (true, true) => "Installed. NES light-gun games".to_owned(),
+                (false, true) => "Not installed. NES light-gun games".to_owned(),
+            };
+            cores = cores.child(setting_row(core, &note).child(self.setting_button(
+                Setting::Core(i),
+                Button::new(("core", i)).label(if installed { "Reinstall" } else { "Install" }).disabled(self.busy),
+                cx,
+            )));
+        }
 
         let mut emulators = card();
         for (i, emulator) in emu::EMULATORS.iter().enumerate() {
@@ -1766,8 +1831,9 @@ impl Hub {
 
         let body = match self.settings_cat {
             0 => setup,
-            1 => emulators,
-            2 => looks,
+            1 => cores,
+            2 => emulators,
+            3 => looks,
             _ => paths,
         };
         let mut categories = div().w(px(200.)).flex_none().p_3().flex().flex_col().gap_1().border_r_1().border_color(rgba(0xffffff14));
@@ -1801,7 +1867,8 @@ impl Hub {
                         cx.notify();
                     }))),
             )
-            .child(div().flex_1().min_h_0().child(body.id("settings-card").max_h_full().overflow_y_scroll().track_scroll(&self.settings_scroll)));
+            // card() is flex_none; let it shrink to the space left here so a long card scrolls.
+            .child(div().flex_1().min_h_0().flex().flex_col().child(body.id("settings-card").flex_shrink().min_h_0().overflow_y_scroll().track_scroll(&self.settings_scroll)));
         // Dims the page behind.
         div()
             .absolute()
