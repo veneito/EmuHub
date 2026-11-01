@@ -9,7 +9,7 @@ use emu::{Config, Game, System};
 use gamepad::Pad;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Disableable, Root, Selectable, Theme, ThemeMode, TitleBar,
+    Disableable, Root, Selectable, Sizable, Theme, ThemeMode, TitleBar,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
@@ -17,6 +17,8 @@ use gpui_component::{
 const MUTED: u32 = 0xa7b4ba;
 const TEXT: u32 = 0xeeeae2;
 const FONT: &str = if cfg!(target_os = "windows") { "Segoe UI" } else { ".SystemUIFont" };
+/// Games the Ctrl+K search shows at once.
+const SEARCH_RESULTS: usize = 8;
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
@@ -87,18 +89,26 @@ struct Details {
 }
 
 const DETAIL_BUTTONS: usize = 4;
-/// Width of the All Games side panel.
+/// Width of Home's side panel.
 const PANEL_WIDTH: f32 = 300.;
 /// Cover choices per row: the 740px choices box fits six 110px tiles with 16px gaps.
 const CHOICE_COLUMNS: usize = 6;
 
-const PALETTES: [(&str, u32, u32); 5] = [
+const PALETTES: [(&str, u32, u32); 6] = [
     ("Teal", 0x0c1417, 0x92c8e5),
+    ("Midnight", 0x0b0b10, 0x9d7bff),
     ("Graphite", 0x151515, 0xc4c4ce),
     ("Blue", 0x101a2d, 0x92b9ff),
     ("Plum", 0x211324, 0xd5a8e3),
     ("Forest", 0x101f19, 0x91cba6),
 ];
+
+/// A row of the sidebar's game list.
+enum LibRow {
+    /// A system's name and game count, starting its group.
+    Header(String, usize),
+    Game(usize),
+}
 
 /// The Settings popup's categories; Paths needs a keyboard, so it has no controller buttons.
 const SETTING_CATEGORIES: [&str; 4] = ["Setup", "Emulators", "Appearance", "Paths"];
@@ -141,6 +151,8 @@ enum UpdateState {
 
 struct Hub {
     query: Entity<InputState>,
+    /// The Ctrl+K search popup is open, with this result picked; it types into `query`.
+    search: Option<usize>,
     roms_dir: Entity<InputState>,
     retroarch_cmd: Entity<InputState>,
     cores_dir: Entity<InputState>,
@@ -168,8 +180,18 @@ struct Hub {
     columns: usize,
     /// The game grid only draws the rows on screen (uniform_list), which keeps big libraries smooth.
     grid_scroll: UniformListScrollHandle,
+    /// The sidebar's game list, also a uniform_list.
+    side_scroll: UniformListScrollHandle,
     /// Games shown in the grid this frame, in order (filter + search applied).
     visible_cache: Vec<usize>,
+    /// The sidebar list's rows this frame, with system headers.
+    rows_cache: Vec<LibRow>,
+    /// Systems whose group is open in the sidebar; they all start closed.
+    expanded: std::collections::HashSet<String>,
+    /// The library shows the selected game's page instead of the grid (a game was clicked).
+    showing_game: bool,
+    /// Games whose screenshot the Details view already asked libretro for.
+    snaps_tried: std::collections::HashSet<std::path::PathBuf>,
     /// Each game's cover file if it has one, parallel to `games`, so drawing never touches the disk.
     covers: Vec<Option<std::path::PathBuf>>,
     /// Each cover's color for the ambient background; None while it's being worked out or if it can't be.
@@ -331,8 +353,25 @@ impl Hub {
                     view.play(i, cx);
                 }
             }
-            InputEvent::Change => cx.notify(),
+            InputEvent::Change => {
+                view.search = view.search.map(|_| 0);
+                cx.notify();
+            }
             _ => {}
+        })
+        .detach();
+        // Ctrl+K (Cmd+K on Mac) anywhere opens the search, whatever has keyboard focus.
+        let hub = cx.entity().downgrade();
+        cx.intercept_keystrokes(move |event, window, cx| {
+            let key = &event.keystroke;
+            if key.key == "k" && key.modifiers.secondary() && !key.modifiers.shift && !key.modifiers.alt {
+                let _ = hub.update(cx, |view, cx| {
+                    if view.details.is_none() {
+                        view.open_search(window, cx);
+                    }
+                });
+                cx.stop_propagation();
+            }
         })
         .detach();
         cx.observe_window_activation(window, |view, window, _| view.active = window.is_window_active()).detach();
@@ -370,6 +409,7 @@ impl Hub {
 
         let mut hub = Self {
             query,
+            search: None,
             roms_dir,
             retroarch_cmd,
             cores_dir,
@@ -391,7 +431,12 @@ impl Hub {
             running: None,
             columns: 1,
             grid_scroll: UniformListScrollHandle::new(),
+            side_scroll: UniformListScrollHandle::new(),
             visible_cache: vec![],
+            rows_cache: vec![],
+            expanded: Default::default(),
+            showing_game: false,
+            snaps_tried: Default::default(),
             covers: vec![],
             tints: Default::default(),
             cover_pass: 0,
@@ -443,6 +488,44 @@ impl Hub {
                 in_view && g.name.to_lowercase().contains(&query)
             })
             .collect()
+    }
+
+    /// The sidebar list: every system with games (matching the search), each followed by its games when open.
+    /// Groups stay open while searching, so matches are never hidden.
+    fn lib_rows(&self, cx: &App) -> Vec<LibRow> {
+        let query = self.query.read(cx).value().to_lowercase();
+        let mut rows = vec![];
+        for system in &self.systems {
+            let games: Vec<usize> = (0..self.games.len()).filter(|&i| self.games[i].system == system.id && self.games[i].name.to_lowercase().contains(&query)).collect();
+            if games.is_empty() {
+                continue;
+            }
+            rows.push(LibRow::Header(system.id.clone(), games.len()));
+            if !query.is_empty() || self.expanded.contains(&system.id) {
+                rows.extend(games.into_iter().map(LibRow::Game));
+            }
+        }
+        rows
+    }
+
+    /// Header clicked: opens its group and shows the system's grid; clicking the open, shown system closes it.
+    fn pick_system(&mut self, system: &str) {
+        if self.view == View::Library && self.system.as_deref() == Some(system) && !self.showing_game && self.expanded.remove(system) {
+            return;
+        }
+        self.expanded.insert(system.to_owned());
+        self.show(&MenuItem::Library(Some(system.to_owned())));
+    }
+
+    /// A game clicked: the library shows its page.
+    fn show_game(&mut self, index: usize) {
+        if self.view != View::Library {
+            self.view = View::Library;
+            self.system = None;
+        }
+        self.selected = Some(index);
+        self.showing_game = true;
+        self.focus = Focus::Grid;
     }
 
     fn rescan(&mut self, cx: &mut Context<Self>) {
@@ -603,6 +686,7 @@ impl Hub {
                 if self.view != View::Home {
                     self.selected = None;
                 }
+                self.showing_game = false;
                 self.view = View::Home;
             }
             MenuItem::Settings => self.settings_open = true,
@@ -610,6 +694,7 @@ impl Hub {
                 if self.view != View::Library || self.system != *system {
                     self.selected = None;
                 }
+                self.showing_game = false;
                 self.view = View::Library;
                 self.system = system.clone();
             }
@@ -635,6 +720,18 @@ impl Hub {
             cx.notify();
             return;
         }
+        if let Some(pick) = self.search {
+            let results = self.search_results(cx);
+            match action {
+                Pad::Up => self.search = Some(pick.saturating_sub(1)),
+                Pad::Down => self.search = Some((pick + 1).min(results.len().saturating_sub(1))),
+                Pad::Confirm => self.search_pick(window, cx),
+                Pad::Back => self.close_search(window, cx),
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         let menu = self.menu();
         match (self.focus, action) {
             (_, Pad::CloseGame) => {} // handled above
@@ -653,8 +750,20 @@ impl Hub {
                     self.show(&menu[i]);
                 }
                 self.focus = Focus::Menu(i);
+                // System entries are headers in the sidebar's list, which scrolls on its own.
+                if let MenuItem::Library(Some(system)) = &menu[i] {
+                    if let Some(row) = self.rows_cache.iter().position(|r| matches!(r, LibRow::Header(s, _) if s == system)) {
+                        self.side_scroll.scroll_to_item(row, ScrollStrategy::Center);
+                    }
+                }
             }
             (Focus::Menu(i), Pad::Confirm | Pad::Right) => {
+                match &menu[i] {
+                    MenuItem::Library(Some(system)) if system != FAVORITES => {
+                        self.expanded.insert(system.clone());
+                    }
+                    _ => {}
+                }
                 self.show(&menu[i]);
                 if menu[i] == MenuItem::Settings {
                     self.focus = Focus::SettingsCat(self.settings_cat);
@@ -665,15 +774,32 @@ impl Hub {
                     self.move_selection(0, cx);
                 }
             }
+            (Focus::Menu(_), Pad::Options) => self.open_search(window, cx),
             (Focus::Menu(_), _) => {}
             (Focus::Home(row, col), _) => self.home_pad(row, col, action, cx),
             // Game grid: Left from the first column, or O, returns to the menu.
+            // A game's page: X plays, O goes back to the grid.
+            (Focus::Grid, _) if self.showing_game => match action {
+                Pad::Confirm => {
+                    if let Some(i) = self.selected {
+                        self.play(i, cx)
+                    }
+                }
+                Pad::Options => {
+                    if let Some(i) = self.selected {
+                        self.open_details(i, cx)
+                    }
+                }
+                Pad::Back => self.showing_game = false,
+                Pad::Left => self.focus = Focus::Menu(self.current_menu()),
+                _ => {}
+            },
             (Focus::Grid, Pad::Back) => self.focus = Focus::Menu(self.current_menu()),
             (Focus::Grid, Pad::Left) if self.grid_position(cx).is_none_or(|p| p % self.columns == 0) => {
                 self.focus = Focus::Menu(self.current_menu())
             }
             (Focus::Grid, Pad::Confirm) => match self.selected {
-                Some(i) => self.play(i, cx),
+                Some(_) => self.showing_game = true,
                 None => self.move_selection(0, cx),
             },
             (Focus::Grid, Pad::Options) => {
@@ -1222,11 +1348,11 @@ impl Hub {
             .items_center()
             .gap_3()
             .px_3()
-            .h(px(40.))
+            .h(px(36.))
             .flex_none()
             .rounded_md()
             .cursor_pointer()
-            .text_size(px(15.))
+            .text_size(px(14.))
             .text_color(rgb(if selected { 0xf5f3ee } else { 0xc3cdd1 }))
             .bg(if selected { rgba((self.appearance.accent << 8) | 0x30) } else { rgba(0x00000000) })
             .hover(|style| style.bg(rgba(0xffffff12)))
@@ -1239,10 +1365,34 @@ impl Hub {
         let menu_len = self.menu().len();
         let focused = |i: usize| self.focus == Focus::Menu(i);
         let home = self.view == View::Home;
-        let mut nav = div()
+        let shortcut = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl K" };
+        let nav = div()
             .flex()
             .flex_col()
             .gap_1()
+            // Looks like a search field; opens the Ctrl+K search (Options on the controller).
+            .child(
+                div()
+                    .id("nav-search")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .h(px(36.))
+                    .mb_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgba(0xffffff0a))
+                    .border_1()
+                    .border_color(rgba(0xffffff14))
+                    .hover(|style| style.bg(rgba(0xffffff12)))
+                    .text_color(rgb(MUTED))
+                    .child(icon("search", 16., rgb(MUTED)))
+                    .child(div().flex_1().child("Search games"))
+                    .child(div().px_1p5().rounded_sm().border_1().border_color(rgba(0xffffff24)).text_xs().child(shortcut))
+                    .on_click(cx.listener(|view, _, window, cx| view.open_search(window, cx))),
+            )
+            .child(div().px_3().pb_1().child(heading("Browse")))
             .child(
                 self.ring(self.nav_row("nav-home", home), focused(0))
                     .child(icon("home", 18., tone(home)))
@@ -1275,34 +1425,15 @@ impl Hub {
                         cx.notify();
                     }))
             })
-            .child(div().px_3().pt_3().pb_1().child(heading("Your Library")));
-        let mut row = 2;
-        for system in &self.systems {
-            let count = self.games.iter().filter(|g| g.system == system.id).count();
-            if count == 0 {
-                continue;
-            }
-            row += 1;
-            let selected = self.view == View::Library && self.system.as_deref() == Some(system.id.as_str());
-            let pick = system.id.clone();
-            nav = nav.child(
-                self.ring(self.nav_row(SharedString::from(format!("sys-{}", system.id)), selected), focused(row))
-                    .child(tile(&system.name, 24.))
-                    .child(div().flex_1().truncate().child(system.name.clone()))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(count.to_string()))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.view = View::Library;
-                        view.system = Some(pick.clone());
-                        cx.notify();
-                    })),
-            );
-        }
+            // Divides the pages from the systems below.
+            .child(div().mx_3().my_2().h(px(1.)).bg(rgba(0xffffff1a)));
+        // The game list scrolls on its own; the sidebar around it doesn't.
+        let nav = nav.flex_1().min_h_0().child(self.side_list(cx));
         div()
             .id("sidebar")
-            .w(px(256.))
+            .w(px(320.))
             .h_full()
             .flex_shrink_0()
-            .overflow_y_scroll()
             .bg(self.appearance.fill(0x081012))
             .p_3()
             .flex()
@@ -1327,90 +1458,184 @@ impl Hub {
             Some(id) => system_name(&self.systems, id).to_owned(),
             None => "All games".to_owned(),
         };
-        let rows = visible.len().div_ceil(self.columns.max(1));
-        let grid = if visible.is_empty() {
-            div().px_6().text_color(rgb(MUTED)).child("No games here.").into_any_element()
-        } else {
-            uniform_list("grid", rows, cx.processor(|view: &mut Hub, range: std::ops::Range<usize>, _, cx| range.map(|row| view.grid_row(row, cx)).collect::<Vec<_>>()))
-                .flex_1()
-                .track_scroll(self.grid_scroll.clone())
-                .into_any_element()
-        };
-        div()
-            .id("library")
-            .size_full()
-            .bg(self.appearance.fill(0x0c1417))
+        // Playnite-style toolbar: title and count, then the library buttons.
+        let toolbar = div()
             .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .items_end()
-                    .gap_6()
-                    .p_6()
-                    .child(tile(&title, 128.).rounded_lg())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(heading("Library"))
-                            .child(div().text_size(px(34.)).font_weight(FontWeight::SEMIBOLD).child(title))
-                            .child(div().text_color(rgb(MUTED)).child(format!(
-                                "{} game{}",
-                                visible.len(),
-                                if visible.len() == 1 { "" } else { "s" }
-                            )))
-                            .child(
-                                div()
-                                    .pt_2()
-                                    .flex()
-                                    .gap_2()
-                                    .child(Button::new("rescan").label("Rescan").on_click(cx.listener(|view, _, _, cx| view.rescan(cx))))
-                                    .child(Button::new("open-library").label("Open").on_click(cx.listener(|view, _, _, cx| {
-                                        // The system's ROM folder, or the whole ROM folder for All games and Favorites.
-                                        let dir = match view.system.as_deref() {
-                                            Some(id) if id != FAVORITES => view.config.roms_dir.join(id),
-                                            _ => view.config.roms_dir.clone(),
-                                        };
-                                        if let Err(error) = emu::open_folder(&dir) {
-                                            view.message = error;
-                                            cx.notify();
-                                        }
-                                    }))),
-                            ),
-                    ),
-            )
-            .child(div().px_6().pb_4().child(Input::new(&self.query)))
-            .child(grid)
+            .items_center()
+            .gap_3()
+            .px_6()
+            .pt_4()
+            .pb_3()
+            // On a game's page: back to the grid it came from.
+            .when(self.showing_game, |bar| {
+                bar.child(
+                    div()
+                        .id("game-back")
+                        .w(px(32.))
+                        .h(px(32.))
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .bg(rgba(0xffffff0a))
+                        .hover(|style| style.bg(rgba(0xffffff1a)))
+                        .child(icon("arrow-left", 18., rgb(TEXT)))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.showing_game = false;
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child(title))
+            .child(div().text_color(rgb(MUTED)).child(format!("{} game{}", visible.len(), if visible.len() == 1 { "" } else { "s" })))
+            .child(div().flex_1())
+            .child(Button::new("rescan").small().label("Rescan").on_click(cx.listener(|view, _, _, cx| view.rescan(cx))))
+            .child(Button::new("open-library").small().label("Open").on_click(cx.listener(|view, _, _, cx| {
+                // The system's ROM folder, or the whole ROM folder for All games and Favorites.
+                let dir = match view.system.as_deref() {
+                    Some(id) if id != FAVORITES => view.config.roms_dir.join(id),
+                    _ => view.config.roms_dir.clone(),
+                };
+                if let Err(error) = emu::open_folder(&dir) {
+                    view.message = error;
+                    cx.notify();
+                }
+            })));
+        let page = div().id("library").size_full().bg(self.appearance.fill(0x0c1417)).flex().flex_col().child(toolbar);
+        if self.showing_game && self.selected.is_some() {
+            // A clicked game fills the page until a system or All games is picked again.
+            return page.child(div().flex_1().min_h_0().flex().border_t_1().border_color(rgba(0xffffff14)).child(self.details_pane(cx)));
+        }
+        page.child(self.game_list(cx))
     }
 
-    /// The All Games side panel: the selected game's cover, facts and buttons.
-    fn game_panel(&self, cx: &mut Context<Self>) -> Div {
-        let panel = div().w(px(PANEL_WIDTH)).h_full().flex_none().p_6().flex().flex_col().gap_3().border_l_1().border_color(rgba(0xffffff14));
+    /// The library's covers.
+    fn game_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.visible_cache.is_empty() {
+            return div().px_6().text_color(rgb(MUTED)).child("No games here.").into_any_element();
+        }
+        let rows = self.visible_cache.len().div_ceil(self.columns.max(1));
+        uniform_list("grid", rows, cx.processor(|view: &mut Hub, range: std::ops::Range<usize>, _, cx| range.map(|row| view.grid_row(row, cx)).collect::<Vec<_>>()))
+            .flex_1()
+            .track_scroll(self.grid_scroll.clone())
+            .into_any_element()
+    }
+
+    /// The sidebar's games, grouped by system under collapsible headers.
+    fn side_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.rows_cache.is_empty() {
+            return div().px_3().text_color(rgb(MUTED)).child("No games here.").into_any_element();
+        }
+        uniform_list("side-list", self.rows_cache.len(), cx.processor(|view: &mut Hub, range: std::ops::Range<usize>, _, cx| range.map(|row| view.side_row(row, cx)).collect::<Vec<_>>()))
+            .flex_1()
+            .track_scroll(self.side_scroll.clone())
+            .into_any_element()
+    }
+
+    /// Asks libretro for the selected game's screenshot once, for its page's background art.
+    fn fetch_selected_snap(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.selected else { return };
+        let game = self.games[index].clone();
+        if !self.snaps_tried.insert(game.path.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            if cx.background_executor().spawn(async move { emu::fetch_snap(&game) }).await {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
+    }
+
+    /// A game's page in the library: background art fading into the page, then the title, buttons and a facts table.
+    fn details_pane(&self, cx: &mut Context<Self>) -> Div {
+        let pane = div().flex_1().min_w_0().h_full().flex().flex_col().overflow_hidden();
         let Some(index) = self.selected else {
-            return panel.justify_center().items_center().text_color(rgb(MUTED)).child("Select a game to see it here.");
+            return pane.items_center().justify_center().text_color(rgb(MUTED)).child("Select a game to see it here.");
         };
         let game = &self.games[index];
-        let favorite = self.favorites.contains(&game.path);
+        let snap = emu::snap_path(game);
+        let art = if snap.exists() { Some(snap) } else { self.covers[index].clone() };
+        let page = self.appearance.fill(0x0c1417);
+        let fade = linear_gradient(180., linear_color_stop(Rgba { a: 0., ..page }, 0.3), linear_color_stop(page, 1.));
+        pane.child(
+            div()
+                .relative()
+                // Most of the page, growing with the window.
+                .h(relative(0.65))
+                .min_h(px(300.))
+                .flex_none()
+                .overflow_hidden()
+                .children(art.map(|art| div().absolute().inset_0().opacity(0.6).child(img(art).size_full().object_fit(ObjectFit::Cover))))
+                .child(div().absolute().inset_0().bg(fade)),
+        )
+        .child(
+            div()
+                .id("details-pane")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px_8()
+                .pb_8()
+                .flex()
+                .flex_col()
+                .gap_4()
+                // Pulled up over the art's fade, like Playnite's title.
+                .mt(px(-56.))
+                .child(div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).line_clamp(2).child(game.name.clone()))
+                .child(self.game_actions(index, cx))
+                .child(self.game_facts(index).max_w(px(520.))),
+        )
+    }
+
+    /// Play, More and Favorite, shared by the game's page and Home's side panel.
+    fn game_actions(&self, index: usize, cx: &mut Context<Self>) -> Div {
+        let favorite = self.favorites.contains(&self.games[index].path);
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .child(Button::new("game-play").primary().label("Play").min_w(px(110.)).on_click(cx.listener(move |view, _, _, cx| view.play(index, cx))))
+            .child(Button::new("game-more").label("More").min_w(px(110.)).on_click(cx.listener(move |view, _, _, cx| view.open_details(index, cx))))
+            .child(Button::new("game-favorite").label(if favorite { "Unfavorite" } else { "Favorite" }).on_click(cx.listener(move |view, _, _, cx| {
+                view.toggle_favorite(index);
+                cx.notify();
+            })))
+    }
+
+    /// The Details table: play time, last played, platform, favorite, file.
+    fn game_facts(&self, index: usize) -> Div {
+        let game = &self.games[index];
+        let fact = |label: &str, value: String| {
+            div().flex().gap_4().py_1().child(div().w(px(100.)).flex_none().text_color(rgb(MUTED)).child(label.to_owned())).child(div().min_w_0().truncate().child(value))
+        };
+        let file = game.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        div()
+            .flex()
+            .flex_col()
+            .child(div().pb_2().child(heading("Details")))
+            .child(fact("Time played", self.playtime.get(&game.path).and_then(|&s| emu::playtime_text(s)).unwrap_or("Never".into())))
+            .child(fact("Last played", self.history.get(&game.path).map_or("Never".into(), |&t| emu::ago(t))))
+            .child(fact("Platform", system_name(&self.systems, &game.system).to_owned()))
+            .child(fact("Favorite", if self.favorites.contains(&game.path) { "Yes" } else { "No" }.into()))
+            .child(fact("File", file))
+    }
+
+    /// Home's side panel: the selected game's cover, facts and buttons.
+    fn game_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let panel = div().w(px(PANEL_WIDTH)).h_full().flex_none().p_6().flex().flex_col().gap_3().border_l_1().border_color(rgba(0xffffff14));
+        let Some(index) = self.selected else {
+            return panel.id("game-panel").justify_center().items_center().text_color(rgb(MUTED)).child("Select a game to see it here.");
+        };
+        let game = &self.games[index];
         panel
+            .id("game-panel")
+            .overflow_y_scroll()
             .child(div().w(px(200.)).h(px(300.)).flex_none().rounded(self.cover_corners()).overflow_hidden().shadow_lg().child(self.cover(index, 200.)))
-            .child(heading(system_name(&self.systems, &game.system)))
             .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).line_clamp(3).child(game.name.clone()))
-            .child(self.played_rows(&game.path))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .pt_2()
-                    .child(Button::new("panel-play").primary().label("Play").on_click(cx.listener(move |view, _, _, cx| view.play(index, cx))))
-                    .child(Button::new("panel-favorite").label(if favorite { "Unfavorite" } else { "Favorite" }).on_click(cx.listener(move |view, _, _, cx| {
-                        view.toggle_favorite(index);
-                        cx.notify();
-                    })))
-                    .child(Button::new("panel-details").label("Details").on_click(cx.listener(move |view, _, _, cx| view.open_details(index, cx)))),
-            )
+            .child(self.game_actions(index, cx))
+            .child(self.game_facts(index).pt_2())
     }
 
     /// The Settings popup: categories on the left, the chosen category's card on the right.
@@ -1606,6 +1831,107 @@ impl Hub {
             )
     }
 
+    // ---- Ctrl+K search ------------------------------------------------------
+
+    /// Games matching the search across the whole library; recently played ones while it's empty.
+    fn search_results(&self, cx: &App) -> Vec<usize> {
+        let query = self.query.read(cx).value().to_lowercase();
+        if query.is_empty() {
+            return self.recent().into_iter().take(SEARCH_RESULTS).collect();
+        }
+        (0..self.games.len()).filter(|&i| self.games[i].name.to_lowercase().contains(&query)).take(SEARCH_RESULTS).collect()
+    }
+
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search = Some(0);
+        self.query.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Closes the popup and clears its text, which also filters the library while it's open.
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search = None;
+        self.query.update(cx, |input, cx| input.set_value("", window, cx));
+        window.blur();
+    }
+
+    /// Enter, X or a click: the picked game's page.
+    fn search_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.search.and_then(|pick| self.search_results(cx).get(pick).copied()) {
+            self.close_search(window, cx);
+            self.show_game(index);
+        }
+    }
+
+    fn search_popup(&self, cx: &mut Context<Self>) -> Div {
+        let pick = self.search.unwrap_or(0);
+        let results = self.search_results(cx);
+        let mut list = div().flex().flex_col().gap_1().p_2();
+        if results.is_empty() {
+            list = list.child(div().p_3().text_color(rgb(MUTED)).child("No games found."));
+        }
+        for (n, &index) in results.iter().enumerate() {
+            let game = &self.games[index];
+            list = list.child(
+                self.nav_row(("search", n), n == pick)
+                    .h(px(56.))
+                    .child(div().w(px(32.)).h(px(44.)).flex_none().rounded_sm().overflow_hidden().child(self.cover(index, 32.)))
+                    .child(div().flex_1().min_w_0().truncate().child(game.name.clone()))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(system_name(&self.systems, &game.system).to_owned()))
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.search = Some(n);
+                        view.search_pick(window, cx);
+                    })),
+            );
+        }
+        let panel = div()
+            .w(px(620.))
+            .max_w(relative(0.94))
+            .rounded_lg()
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgba(0xffffff1f))
+            .bg(self.appearance.fill(0x0c1417))
+            .shadow_lg()
+            // Clicks inside don't reach the backdrop, which closes the search.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().p_3().border_b_1().border_color(rgba(0xffffff14)).child(Input::new(&self.query).prefix(icon("search", 16., rgb(MUTED)))))
+            .child(list);
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_start()
+            .justify_center()
+            .pt(px(96.))
+            .bg(rgba(0x00000099))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, cx.listener(|view, _, window, cx| {
+                view.close_search(window, cx);
+                cx.notify();
+            }))
+            // Ahead of the input, so arrows, Enter and Escape drive the results.
+            .capture_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                let len = view.search_results(cx).len();
+                let pick = view.search.unwrap_or(0);
+                match event.keystroke.key.as_str() {
+                    "up" => view.search = Some(pick.saturating_sub(1)),
+                    "down" => view.search = Some((pick + 1).min(len.saturating_sub(1))),
+                    "enter" => view.search_pick(window, cx),
+                    "escape" => view.close_search(window, cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(panel)
+    }
+
     fn save_appearance(&mut self, cx: &mut Context<Self>) {
         self.appearance.apply_theme(cx);
         self.message = match self.appearance.save() {
@@ -1751,6 +2077,33 @@ impl Hub {
         }
     }
 
+    /// One row of the sidebar list, the same height on every row for uniform_list: a system header or a game.
+    fn side_row(&self, row: usize, cx: &mut Context<Self>) -> Div {
+        match &self.rows_cache[row] {
+            LibRow::Game(index) => self.list_row(*index, cx),
+            LibRow::Header(system, count) => {
+                let open = self.expanded.contains(system) || !self.query.read(cx).value().is_empty();
+                let shown = self.view == View::Library && self.system.as_ref() == Some(system) && !self.showing_game;
+                let focused = self.menu().iter().position(|m| *m == MenuItem::Library(Some(system.clone()))).is_some_and(|i| self.focus == Focus::Menu(i));
+                let pick = system.clone();
+                // Styled like the Home and All games buttons above it.
+                let header = self
+                    .ring(self.nav_row(SharedString::from(format!("group-{system}")), shown), focused)
+                    .h(px(32.))
+                    .w_full()
+                    .child(icon(if open { "chevron-down" } else { "chevron-right" }, 16., rgb(if shown { TEXT } else { MUTED })))
+                    .child(div().flex_1().min_w_0().truncate().child(system_name(&self.systems, system).to_owned()))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(count.to_string()))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.pick_system(&pick);
+                        cx.notify();
+                    }));
+                // 34px like a game row, which uniform_list needs.
+                div().w_full().h(px(34.)).px_2().py_px().child(header)
+            }
+        }
+    }
+
     /// One row of the game grid. Rows have a fixed height, which uniform_list needs.
     fn grid_row(&self, row: usize, cx: &mut Context<Self>) -> Div {
         let start = row * self.columns.max(1);
@@ -1776,8 +2129,7 @@ impl Hub {
                         }),
                     )
                     .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
-                        view.selected = Some(index);
-                        view.focus = Focus::Grid;
+                        view.show_game(index);
                         if event.click_count() >= 2 {
                             view.play(index, cx);
                         }
@@ -1804,6 +2156,49 @@ impl Hub {
             );
         }
         cards
+    }
+
+    /// One game in the sidebar's list, the same height on every row for uniform_list.
+    fn list_row(&self, index: usize, cx: &mut Context<Self>) -> Div {
+        let game = &self.games[index];
+        let selected = self.selected == Some(index);
+        let accent = self.appearance.accent;
+        let row = div()
+            .id(("game", index))
+            .h(px(30.))
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .rounded_md()
+            .cursor_pointer()
+            .border_1()
+            // Bright when the controller is in the list, dim while it's in the side menu.
+            .border_color(match (selected, self.focus == Focus::Grid) {
+                (true, true) => rgb(accent).into(),
+                (true, false) => rgba((accent << 8) | 0x60),
+                _ => rgba(0x00000000),
+            })
+            .bg(if selected { rgba((accent << 8) | 0x20) } else { rgba(0x00000000) })
+            .hover(|style| style.bg(rgba(0xffffff0a)))
+            .child(div().w(px(18.)).h(px(24.)).flex_none().rounded_sm().overflow_hidden().child(self.cover(index, 18.)))
+            .child(div().flex_1().min_w_0().truncate().child(game.name.clone()))
+            .children(self.favorites.contains(&game.path).then(|| icon("heart-filled", 14., rgb(accent))))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                    view.focus = Focus::Grid;
+                    view.open_details(index, cx);
+                }),
+            )
+            .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
+                view.show_game(index);
+                if event.click_count() >= 2 {
+                    view.play(index, cx);
+                }
+                cx.notify();
+            }));
+        div().px_2().py_0p5().child(row)
     }
 
     /// A Home row of covers (Continue Playing or Favorites): click selects, double-click plays, right-click opens the game page.
@@ -1982,8 +2377,11 @@ impl Hub {
         if self.details.is_some() {
             return vec![(Hint::Confirm, "Select"), (Hint::Back, "Back")];
         }
+        if self.search.is_some() {
+            return vec![(Hint::Confirm, "Open"), (Hint::Back, "Close")];
+        }
         match self.focus {
-            Focus::Menu(_) => vec![(Hint::Confirm, "Open"), (Hint::Bumpers, "Switch system")],
+            Focus::Menu(_) => vec![(Hint::Confirm, "Open"), (Hint::Options, "Search"), (Hint::Bumpers, "Switch system")],
             Focus::Grid | Focus::Home(0 | 1, _) => vec![(Hint::Confirm, "Play"), (Hint::Options, "Details"), (Hint::Back, "Back")],
             Focus::Home(..) => vec![(Hint::Confirm, "Open"), (Hint::Back, "Back")],
             Focus::Settings(_) | Focus::SettingsCat(_) => vec![(Hint::Confirm, "Select"), (Hint::Back, "Back")],
@@ -2096,15 +2494,19 @@ impl Render for Hub {
             self.focus = Focus::Menu(self.current_menu());
         }
         // Sidebar, window padding, border and grid padding; each card is 150px plus a 20px gap.
-        let chrome = if self.sidebar_open { 256. } else { 0. } + 16. + 4. + 2. + 48. + if self.view == View::Library { PANEL_WIDTH } else { 0. };
+        let chrome = if self.sidebar_open { 320. } else { 0. } + 16. + 4. + 2. + 48.;
         let content = window.viewport_size().width / px(1.) - chrome;
         self.columns = ((content + 20.) / 170.).floor().max(1.) as usize;
         let visible = self.visible(cx);
         self.visible_cache = visible.clone();
+        self.rows_cache = self.lib_rows(cx);
+        if self.showing_game {
+            self.fetch_selected_snap(cx);
+        }
         let page = match self.view {
             View::Home if self.selected.is_some() => div().id("home-split").size_full().flex().child(self.home_page(cx).flex_1().min_w_0()).child(self.game_panel(cx)),
             View::Home => self.home_page(cx),
-            View::Library => div().id("library-split").size_full().flex().child(self.library_page(&visible, cx).flex_1().min_w_0()).child(self.game_panel(cx)),
+            View::Library => self.library_page(&visible, cx),
         };
         let mut body = div().flex_1().min_h_0().flex().p_2().gap_1();
         if self.sidebar_open {
@@ -2188,6 +2590,7 @@ impl Render for Hub {
             .child(self.bottom_bar())
             .children(toast)
             .when(self.settings_open && self.details.is_none(), |d| d.child(self.settings_popup(cx)))
+            .when(self.search.is_some(), |d| d.child(self.search_popup(cx)))
             .children(self.update_popup(cx))
     }
 }
@@ -2195,8 +2598,7 @@ impl Render for Hub {
 fn main() {
     emu::add_to_app_menu();
     Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
-        gpui_component::init(cx);
-        Theme::change(ThemeMode::Dark, None, cx);
+        gpui_component::init(cx);        Theme::change(ThemeMode::Dark, None, cx);
         Theme::global_mut(cx).colors.background = rgba(0x00000000).into();
         let bounds = Bounds::centered(None, size(px(1240.), px(800.)), cx);
         cx.open_window(
