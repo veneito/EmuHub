@@ -113,6 +113,12 @@ struct Details {
 const DETAIL_BUTTONS: usize = 8;
 /// Cover choices per row: the 740px choices box fits six 110px tiles with 16px gaps.
 const CHOICE_COLUMNS: usize = 6;
+/// While choosing art, the controls after the buttons: Search, From file, then the Cover/Background/Logo/Icon tabs.
+const ART_SEARCH: usize = DETAIL_BUTTONS;
+const ART_FILE: usize = DETAIL_BUTTONS + 1;
+const ART_TABS: usize = DETAIL_BUTTONS + 2;
+/// The first art choice; choices follow in rows of CHOICE_COLUMNS.
+const FIRST_CHOICE: usize = ART_TABS + emu::Art::ALL.len();
 
 const PALETTES: [(&str, u32, u32); 6] = [
     ("Teal", 0x0c1417, 0x92c8e5),
@@ -229,6 +235,8 @@ struct Hub {
     expanded: std::collections::HashSet<String>,
     /// The library shows the selected game's page instead of the grid (a game was clicked).
     showing_game: bool,
+    /// The game page button the controller is on: 0 Play, 1 More, 2 Favorite.
+    game_button: usize,
     /// Games whose screenshot the Details view already asked libretro for.
     snaps_tried: std::collections::HashSet<std::path::PathBuf>,
     /// Each game's cover file if it has one, parallel to `games`, so drawing never touches the disk.
@@ -522,6 +530,7 @@ impl Hub {
             rows_cache: vec![],
             expanded: Default::default(),
             showing_game: false,
+            game_button: 0,
             snaps_tried: Default::default(),
             covers: vec![],
             icons: vec![],
@@ -617,6 +626,7 @@ impl Hub {
         }
         self.selected = Some(index);
         self.showing_game = true;
+        self.game_button = 0;
         self.focus = Focus::Grid;
     }
 
@@ -935,11 +945,18 @@ impl Hub {
             // Game grid: Left from the first column, or O, returns to the menu.
             // A game's page: X plays, O goes back to the grid.
             (Focus::Grid, _) if self.showing_game => match action {
+                // X presses the focused button: Play, More or Favorite.
                 Pad::Confirm => {
                     if let Some(i) = self.selected {
-                        self.play(i, cx)
+                        match self.game_button {
+                            0 => self.play(i, cx),
+                            1 => self.open_details(i, cx),
+                            _ => self.toggle_favorite(i),
+                        }
                     }
                 }
+                Pad::Right => self.game_button = (self.game_button + 1).min(2),
+                Pad::Left if self.game_button > 0 => self.game_button -= 1,
                 Pad::Options => {
                     if let Some(i) = self.selected {
                         self.open_details(i, cx)
@@ -954,7 +971,10 @@ impl Hub {
                 self.focus = Focus::Menu(self.current_menu())
             }
             (Focus::Grid, Pad::Confirm) => match self.selected {
-                Some(_) => self.showing_game = true,
+                Some(_) => {
+                    self.showing_game = true;
+                    self.game_button = 0;
+                }
                 None => self.move_selection(0, cx),
             },
             (Focus::Grid, Pad::Options) => {
@@ -1010,7 +1030,9 @@ impl Hub {
     /// Controller on the game page: any direction steps through the buttons and cover choices.
     fn details_pad(&mut self, action: Pad, window: &mut Window, cx: &mut Context<Self>) {
         let Some(details) = &mut self.details else { return };
-        let count = DETAIL_BUTTONS + details.candidates.as_ref().map_or(0, Vec::len);
+        let choosing = details.loading || details.candidates.is_some();
+        let count = if choosing { FIRST_CHOICE + details.candidates.as_ref().map_or(0, Vec::len) } else { DETAIL_BUTTONS };
+        let tab = ART_TABS + emu::Art::ALL.iter().position(|&a| a == details.art).unwrap_or(0);
         let focus = details.focus;
         if let Some(pick) = details.picking {
             let game = details.game;
@@ -1025,7 +1047,7 @@ impl Hub {
             }
             return;
         }
-        // Buttons are one row; covers follow in rows of CHOICE_COLUMNS.
+        // Rows, top to bottom: Back, the buttons, Search and From file, the art tabs, then the choices.
         let next = match action {
             Pad::Back if details.renaming => {
                 details.renaming = false;
@@ -1045,16 +1067,21 @@ impl Hub {
             Pad::Left => focus.saturating_sub(1),
             Pad::Right => (focus + 1).min(count - 1),
             // Back sits above the button row.
+            Pad::Up if focus == DETAIL_BUTTONS - 1 => focus,
             Pad::Up if focus < DETAIL_BUTTONS => DETAIL_BUTTONS - 1,
             Pad::Down if focus == DETAIL_BUTTONS - 1 => 0,
-            Pad::Up if focus < DETAIL_BUTTONS + CHOICE_COLUMNS => 2, // first row of covers → Change cover
+            Pad::Down if focus < DETAIL_BUTTONS => if choosing { ART_SEARCH } else { focus },
+            Pad::Up if focus < ART_TABS => 2, // Search, From file → Change art
+            Pad::Down if focus < ART_TABS => tab,
+            Pad::Up if focus < FIRST_CHOICE => ART_SEARCH,
+            Pad::Down if focus < FIRST_CHOICE => FIRST_CHOICE.min(count - 1),
+            Pad::Up if focus < FIRST_CHOICE + CHOICE_COLUMNS => tab,
             Pad::Up => focus - CHOICE_COLUMNS,
-            Pad::Down if focus < DETAIL_BUTTONS => DETAIL_BUTTONS.min(count - 1),
             Pad::Down => (focus + CHOICE_COLUMNS).min(count - 1),
         };
         details.focus = next;
-        if next >= DETAIL_BUTTONS {
-            details.scroll.scroll_to_item(next - DETAIL_BUTTONS);
+        if next >= FIRST_CHOICE {
+            details.scroll.scroll_to_item(next - FIRST_CHOICE);
         }
     }
 
@@ -1120,7 +1147,8 @@ impl Hub {
             return;
         }
         details.art = kind;
-        details.focus = 2;
+        // The new choices replace the old ones, so the ring moves to this kind's tab.
+        details.focus = ART_TABS + emu::Art::ALL.iter().position(|&a| a == kind).unwrap_or(0);
         let name = self.cover_query.read(cx).value().trim().to_owned();
         self.search_covers(name, cx);
     }
@@ -1276,8 +1304,14 @@ impl Hub {
                 self.set_game_option(game.path.clone(), |o| o.hidden = true, cx);
             }
             7 => self.details = None,
+            ART_SEARCH => {
+                let name = self.cover_query.read(cx).value().trim().to_owned();
+                self.search_covers(name, cx);
+            }
+            ART_FILE => self.cover_from_file(cx),
+            n if n < FIRST_CHOICE => self.switch_art(emu::Art::ALL[n - ART_TABS], cx),
             n => {
-                let Some(choice) = details.candidates.as_ref().and_then(|c| c.get(n - DETAIL_BUTTONS)) else { return };
+                let Some(choice) = details.candidates.as_ref().and_then(|c| c.get(n - FIRST_CHOICE)) else { return };
                 let (url, kind) = (choice.url.clone(), details.art);
                 self.run("Downloading art…", move |_| emu::set_art(&game, kind, &url).map(|()| format!("{} updated.", kind.label())), cx);
             }
@@ -1411,20 +1445,23 @@ impl Hub {
                     .items_center()
                     .gap_3()
                     .child(div().w(px(420.)).child(Input::new(&self.cover_query)))
-                    .child(Button::new("cover-search").label("Search").disabled(details.loading).on_click(cx.listener(|view, _, _, cx| {
-                        let name = view.cover_query.read(cx).value().trim().to_owned();
-                        view.search_covers(name, cx);
-                    })))
-                    .child(Button::new("cover-file").label("From file…").on_click(cx.listener(|view, _, _, cx| view.cover_from_file(cx)))),
+                    .child(self.ring(div().rounded_md(), focused(ART_SEARCH)).child(
+                        Button::new("cover-search").label("Search").disabled(details.loading).on_click(cx.listener(|view, _, window, cx| view.details_action(ART_SEARCH, window, cx))),
+                    ))
+                    .child(self.ring(div().rounded_md(), focused(ART_FILE)).child(
+                        Button::new("cover-file").label("From file…").on_click(cx.listener(|view, _, window, cx| view.details_action(ART_FILE, window, cx))),
+                    )),
             );
-            // Which art to choose; LB/RB on a controller.
+            // Which art to choose; also LB/RB on a controller.
             let mut tabs = div().flex().gap_2();
-            for kind in emu::Art::ALL {
+            for (i, kind) in emu::Art::ALL.into_iter().enumerate() {
                 tabs = tabs.child(
-                    Button::new(SharedString::from(format!("art-{}", kind.label())))
-                        .label(kind.label())
-                        .selected(details.art == kind)
-                        .on_click(cx.listener(move |view, _, _, cx| view.switch_art(kind, cx))),
+                    self.ring(div().rounded_md(), focused(ART_TABS + i)).child(
+                        Button::new(SharedString::from(format!("art-{}", kind.label())))
+                            .label(kind.label())
+                            .selected(details.art == kind)
+                            .on_click(cx.listener(move |view, _, _, cx| view.switch_art(kind, cx))),
+                    ),
                 );
             }
             panel = panel.child(tabs);
@@ -1442,7 +1479,7 @@ impl Hub {
                 .flex_wrap()
                 .gap_4();
             for (n, choice) in candidates.iter().enumerate() {
-                let item = DETAIL_BUTTONS + n;
+                let item = FIRST_CHOICE + n;
                 choices = choices.child(
                     div()
                         .id(("cover-choice", n))
@@ -2146,16 +2183,21 @@ impl Hub {
     /// Play, More and Favorite, shared by the game's page and Home's side panel.
     fn game_actions(&self, index: usize, cx: &mut Context<Self>) -> Div {
         let favorite = self.favorites.contains(&self.games[index].path);
+        // The controller's ring sits on the button Left/Right picked.
+        let ring = |i: usize, button: Button| self.ring(div().rounded_md(), self.focus == Focus::Grid && self.game_button == i).child(button);
         div()
             .flex()
             .flex_wrap()
             .gap_2()
-            .child(Button::new("game-play").primary().label("Play").min_w(px(110.)).on_click(cx.listener(move |view, _, _, cx| view.play(index, cx))))
-            .child(Button::new("game-more").label("More").min_w(px(110.)).on_click(cx.listener(move |view, _, _, cx| view.open_details(index, cx))))
-            .child(Button::new("game-favorite").label(if favorite { "Unfavorite" } else { "Favorite" }).on_click(cx.listener(move |view, _, _, cx| {
-                view.toggle_favorite(index);
-                cx.notify();
-            })))
+            .child(ring(0, Button::new("game-play").primary().label("Play").min_w(px(110.)).on_click(cx.listener(move |view, _, _, cx| view.play(index, cx)))))
+            .child(ring(1, Button::new("game-more").label("More").min_w(px(110.)).on_click(cx.listener(move |view, _, _, cx| view.open_details(index, cx)))))
+            .child(ring(
+                2,
+                Button::new("game-favorite").label(if favorite { "Unfavorite" } else { "Favorite" }).on_click(cx.listener(move |view, _, _, cx| {
+                    view.toggle_favorite(index);
+                    cx.notify();
+                })),
+            ))
     }
 
     /// The Details table: play time, last played, platform, favorite, file.
