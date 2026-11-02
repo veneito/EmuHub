@@ -77,6 +77,8 @@ enum Setting {
     ClearPcFolders,
     /// Show every game hidden from its game page again.
     UnhideGames,
+    /// Download (or refresh) LaunchBox's games database for art.
+    LaunchBox,
     Palette(usize),
     SquareCovers(bool),
     Backdrop(appearance::Backdrop),
@@ -109,8 +111,6 @@ struct Details {
 
 /// Play, Favorite, Change cover, Rename, Emulator, Program, Hide, Back.
 const DETAIL_BUTTONS: usize = 8;
-/// Width of Home's side panel.
-const PANEL_WIDTH: f32 = 300.;
 /// Cover choices per row: the 740px choices box fits six 110px tiles with 16px gaps.
 const CHOICE_COLUMNS: usize = 6;
 
@@ -135,6 +135,8 @@ const SETTING_CATEGORIES: [&str; 5] = ["Setup", "Cores", "Emulators", "Appearanc
 
 /// emu::all_cores(), parsed once: settings_items() runs for every Settings button drawn.
 static CORES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(emu::all_cores);
+/// The cores Install all gets: each system's own, plus the Zapper core.
+static MAIN_CORES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(emu::needed_cores);
 
 /// (category, row in that category's card) of a Settings button.
 fn setting_place(setting: Setting) -> (usize, usize) {
@@ -147,6 +149,7 @@ fn setting_place(setting: Setting) -> (usize, usize) {
         Setting::SteamGames => (0, 5),
         Setting::AddPcFolder | Setting::ClearPcFolders => (0, 6),
         Setting::UnhideGames => (0, 7),
+        Setting::LaunchBox => (0, 8),
         Setting::Core(i) => (1, i),
         Setting::EmulatorFolder(i) | Setting::PickEmulator(i) | Setting::EmulatorSite(i) => (2, i),
         Setting::Palette(_) => (3, 0),
@@ -158,7 +161,7 @@ fn setting_place(setting: Setting) -> (usize, usize) {
 
 /// The Settings buttons a controller can reach, in on-screen order: Setup, Cores, Emulators, Appearance.
 fn settings_items() -> Vec<Setting> {
-    let mut items = vec![Setting::EmulationFolder, Setting::RomFolders, Setting::RetroArch, Setting::CoreList, Setting::Cores, Setting::SteamGames, Setting::AddPcFolder, Setting::ClearPcFolders, Setting::UnhideGames];
+    let mut items = vec![Setting::EmulationFolder, Setting::RomFolders, Setting::RetroArch, Setting::CoreList, Setting::Cores, Setting::SteamGames, Setting::AddPcFolder, Setting::ClearPcFolders, Setting::UnhideGames, Setting::LaunchBox];
     items.extend((0..CORES.len()).map(Setting::Core));
     for i in 0..emu::EMULATORS.len() {
         items.extend([Setting::EmulatorFolder(i), Setting::PickEmulator(i), Setting::EmulatorSite(i)]);
@@ -240,6 +243,10 @@ struct Hub {
     scan_pass: usize,
     /// The first scan has finished; until then pages show placeholders.
     scanned: bool,
+    /// EmuHub's banner on disk, for the Home hero and background when there's no game art.
+    banner: std::path::PathBuf,
+    /// Picks the background's random favorite when no game is selected; set once per scan so it doesn't change on every redraw.
+    idle_seed: usize,
     /// Horizontal scroll of the Home rows, so the controller's card stays in view.
     home_scroll: [ScrollHandle; 3],
     /// Vertical scroll of the Home page and the Settings popup's card, so the controller's item stays in view.
@@ -522,6 +529,8 @@ impl Hub {
             cover_pass: 0,
             scan_pass: 0,
             scanned: false,
+            banner: emu::banner_path(),
+            idle_seed: 0,
             home_scroll: [ScrollHandle::new(), ScrollHandle::new(), ScrollHandle::new()],
             home_page_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
@@ -653,6 +662,8 @@ impl Hub {
         self.scanned = true;
         self.games = games;
         self.covers = covers;
+        // No rand crate for one pick: the clock's nanoseconds are random enough.
+        self.idle_seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as usize);
         self.selected = selected.and_then(|path| self.games.iter().position(|g| g.path == path));
         // The game page follows its game to its new place, and closes if the game was hidden.
         match details.and_then(|path| self.games.iter().position(|g| g.path == path)) {
@@ -752,16 +763,6 @@ impl Hub {
         open
     }
 
-    /// The game's logo when one is cached, else its name as large text.
-    fn title_or_logo(&self, game: &Game, text_size: f32, logo_height: f32) -> AnyElement {
-        let logo = emu::art_path(game, emu::Art::Logo);
-        if logo.exists() {
-            // Left-aligned like the text it replaces.
-            div().h(px(logo_height)).max_w(px(logo_height * 4.)).child(img(logo).h_full().object_fit(ObjectFit::Contain)).into_any_element()
-        } else {
-            div().text_size(px(text_size)).font_weight(FontWeight::SEMIBOLD).line_clamp(2).child(game.name.clone()).into_any_element()
-        }
-    }
 
     /// Steam games show Steam's play time and last played, when Steam's are the newer numbers.
     fn merge_steam_stats(&mut self) {
@@ -1374,11 +1375,22 @@ impl Hub {
                                     ),
                             )
                             .child(heading(system_name(&self.systems, &game.system)))
-                            .child(self.title_or_logo(game, 40., 100.))
+                            .child(div().text_size(px(40.)).font_weight(FontWeight::SEMIBOLD).child(game.name.clone()))
                             .child(self.played_rows(&game.path))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(game.path.display().to_string()))
                             .child(buttons),
-                    ),
+                    )
+                    // The logo on the right, in the layout rather than over it, so a narrow window shrinks it
+                    // and wraps the title instead of overlapping them.
+                    .children(Some(emu::art_path(game, emu::Art::Logo)).filter(|l| l.exists()).map(|logo| {
+                        // As tall as the cover, with the logo in its top half, so it lines up with the cover's top.
+                        div()
+                            .w(px(360.))
+                            .h(px(360.))
+                            .flex_shrink()
+                            .min_w_0()
+                            .child(div().w_full().h(px(180.)).child(img(logo).size_full().object_fit(ObjectFit::Contain)))
+                    })),
             );
         if details.renaming {
             panel = panel.child(
@@ -1579,6 +1591,32 @@ impl Hub {
                 })
                 .detach();
             }
+            Setting::LaunchBox if !self.busy => {
+                self.busy = true;
+                self.message = "Downloading the LaunchBox database (about 110 MB)…".into();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let count = emu::update_launchbox()?;
+                            // Games that had no art may have some now.
+                            emu::forget_art_misses();
+                            Ok::<_, String>(count)
+                        })
+                        .await;
+                    let _ = this.update(cx, |view, cx| {
+                        view.busy = false;
+                        view.message = match result {
+                            Ok(count) => format!("LaunchBox database ready: art for {count} games. Looking for missing covers."),
+                            Err(error) => error,
+                        };
+                        view.fetch_covers(cx);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            Setting::LaunchBox => {}
             Setting::UnhideGames => {
                 for options in self.game_options.values_mut() {
                     options.hidden = false;
@@ -1948,6 +1986,10 @@ impl Hub {
             .px_6()
             .pt_4()
             .pb_3()
+            // Solid bar with a line under it; the page below is see-through to the window's background.
+            .bg(self.appearance.fill(0x0c1417))
+            .border_b_1()
+            .border_color(rgba(0xffffff14))
             // On a game's page: back to the grid it came from.
             .when(self.showing_game, |bar| {
                 bar.child(
@@ -1984,10 +2026,10 @@ impl Hub {
                     cx.notify();
                 }
             })));
-        let page = div().id("library").size_full().bg(self.appearance.fill(0x0c1417)).flex().flex_col().child(toolbar);
+        let page = div().id("library").size_full().flex().flex_col().child(toolbar);
         if self.showing_game && self.selected.is_some() {
             // A clicked game fills the page until a system or All games is picked again.
-            return page.child(div().flex_1().min_h_0().flex().border_t_1().border_color(rgba(0xffffff14)).child(self.details_pane(cx)));
+            return page.child(div().flex_1().min_h_0().flex().child(self.details_pane(cx)));
         }
         page.child(self.game_list(cx))
     }
@@ -2051,7 +2093,8 @@ impl Hub {
 
     /// A game's page in the library: background art fading into the page, then the title, buttons and a facts table.
     fn details_pane(&self, cx: &mut Context<Self>) -> Div {
-        let pane = div().flex_1().min_w_0().h_full().flex().flex_col().overflow_hidden();
+        // Its own solid fill: the art fades into this color, so the see-through library page mustn't show below it.
+        let pane = div().flex_1().min_w_0().h_full().flex().flex_col().overflow_hidden().bg(self.appearance.fill(0x0c1417));
         let Some(index) = self.selected else {
             return pane.items_center().justify_center().text_color(rgb(MUTED)).child("Select a game to see it here.");
         };
@@ -2075,6 +2118,10 @@ impl Hub {
                 .flex_none()
                 .overflow_hidden()
                 .children(art.map(|art| div().absolute().inset_0().opacity(0.6).child(img(art).size_full().object_fit(ObjectFit::Cover))))
+                // The logo sits on the background's right side, clear of the title and buttons.
+                .children(Some(emu::art_path(game, emu::Art::Logo)).filter(|l| l.exists()).map(|logo| {
+                    div().absolute().top(px(24.)).right(px(32.)).w(px(280.)).h(px(140.)).child(img(logo).size_full().object_fit(ObjectFit::Contain))
+                }))
                 .child(div().absolute().inset_0().bg(fade)),
         )
         .child(
@@ -2090,7 +2137,7 @@ impl Hub {
                 .gap_4()
                 // Pulled up over the art's fade, like Playnite's title.
                 .mt(px(-56.))
-                .child(self.title_or_logo(game, 30., 80.))
+                .child(div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).line_clamp(2).child(game.name.clone()))
                 .child(self.game_actions(index, cx))
                 .child(self.game_facts(index).max_w(px(520.))),
         )
@@ -2127,22 +2174,6 @@ impl Hub {
             .child(fact("Platform", system_name(&self.systems, &game.system).to_owned()))
             .child(fact("Favorite", if self.favorites.contains(&game.path) { "Yes" } else { "No" }.into()))
             .child(fact("File", file))
-    }
-
-    /// Home's side panel: the selected game's cover, facts and buttons.
-    fn game_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let panel = div().w(px(PANEL_WIDTH)).h_full().flex_none().p_6().flex().flex_col().gap_3().border_l_1().border_color(rgba(0xffffff14));
-        let Some(index) = self.selected else {
-            return panel.id("game-panel").justify_center().items_center().text_color(rgb(MUTED)).child("Select a game to see it here.");
-        };
-        let game = &self.games[index];
-        panel
-            .id("game-panel")
-            .overflow_y_scroll()
-            .child(div().w(px(200.)).h(px(300.)).flex_none().rounded(self.cover_corners()).overflow_hidden().shadow_lg().child(self.cover(index, 200.)))
-            .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).line_clamp(3).child(game.name.clone()))
-            .child(self.game_actions(index, cx))
-            .child(self.game_facts(index).pt_2())
     }
 
     /// The Settings popup: categories on the left, the chosen category's card on the right.
@@ -2208,11 +2239,10 @@ impl Hub {
             .child(
                 setting_row(
                     "Cores",
-                    &if missing == 0 {
-                        format!("All {total} cores installed.")
-                    } else {
-                        format!("{missing} of {total} cores missing. Downloads them from libretro.")
-                    },
+                    &format!(
+                        "{} Optional alternate cores are in the list, installed one by one.",
+                        if missing == 0 { format!("All {total} main cores installed.") } else { format!("{missing} of {total} main cores missing. Install all downloads them from libretro.") }
+                    ),
                 )
                 .child(
                     div()
@@ -2259,19 +2289,36 @@ impl Hub {
                 let hidden = self.game_options.values().filter(|o| o.hidden).count();
                 setting_row("Hidden games", &format!("{hidden} hidden from their game pages."))
                     .child(self.setting_button(Setting::UnhideGames, Button::new("unhide-games").label("Unhide all").disabled(hidden == 0), cx))
+            })
+            .child({
+                let updated = emu::launchbox_updated();
+                let note = match updated {
+                    Some(when) => format!("Covers, logos and backgrounds with no API key. Downloaded {}.", emu::ago(when)),
+                    None => "Covers, logos and backgrounds with no API key. Downloads LaunchBox's games database once (about 110 MB) and keeps a small index.".to_owned(),
+                };
+                setting_row("LaunchBox art", &note).child(self.setting_button(
+                    Setting::LaunchBox,
+                    Button::new("launchbox").label(if updated.is_some() { "Refresh" } else { "Download" }).disabled(self.busy),
+                    cx,
+                ))
             });
 
         let mut cores = card();
         for (i, core) in CORES.iter().enumerate() {
-            let systems: Vec<&str> = self.systems.iter().filter(|s| &s.core == core || s.alts.contains(core)).map(|s| s.name.as_str()).collect();
+            let names = |pick: &dyn Fn(&emu::System) -> bool| self.systems.iter().filter(|s| pick(s)).map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
+            let (main, alternate) = (names(&|s| &s.core == core), names(&|s| s.alts.contains(core)));
             let installed = emu::core_installed(&self.config, core);
-            let note = match (installed, systems.is_empty()) {
-                (true, false) => format!("Installed. {}", systems.join(", ")),
-                (false, false) => format!("Not installed. {}", systems.join(", ")),
-                // The Zapper core isn't any system's main core.
-                (true, true) => "Installed. NES light-gun games".to_owned(),
-                (false, true) => "Not installed. NES light-gun games".to_owned(),
-            };
+            let mut note = vec![(if installed { "Installed." } else { "Not installed." }).to_owned()];
+            if !main.is_empty() {
+                note.push(format!("Main core for {main}."));
+            } else if MAIN_CORES.contains(core) {
+                // The Zapper core isn't any system's main core, but Install all gets it.
+                note.push("Used for NES light-gun games.".to_owned());
+            }
+            if !alternate.is_empty() {
+                note.push(format!("Optional alternate for {alternate}."));
+            }
+            let note = note.join(" ");
             cores = cores.child(setting_row(core, &note).child(self.setting_button(
                 Setting::Core(i),
                 Button::new(("core", i)).label(if installed { "Reinstall" } else { "Install" }).disabled(self.busy),
@@ -2530,8 +2577,8 @@ impl Hub {
             (None, Some(i), ..) => i,
             (None, None, View::Home, Focus::Home(0, c)) => *self.recent().get(c)?,
             (None, None, View::Home, Focus::Home(1, c)) => *self.favorite_games().get(c)?,
-            (None, None, View::Home, _) => *self.recent().first()?,
-            _ => return None,
+            (None, None, View::Home, _) => self.recent().first().copied().filter(|&i| self.covers[i].is_some()).or_else(|| self.idle_game())?,
+            _ => self.idle_game()?,
         };
         self.covers.get(index)?.clone()
     }
@@ -2568,6 +2615,18 @@ impl Hub {
     }
 
     /// Favorite games in library order (the Favorites row).
+    /// The whole banner, never cropped: shrunk to fit the hero, on its own edge color so the bars don't show.
+    fn banner_art(&self) -> AnyElement {
+        div().size_full().bg(rgb(0x0f051a)).child(img(self.banner.clone()).size_full().object_fit(ObjectFit::Contain)).into_any_element()
+    }
+
+    /// The background's game when none is selected: a random favorite with a cover, else the first game with a cover.
+    /// None only while no game has a cover yet; the page's plain background shows then.
+    fn idle_game(&self) -> Option<usize> {
+        let favorites: Vec<usize> = self.favorite_games().into_iter().filter(|&i| self.covers[i].is_some()).collect();
+        favorites.get(self.idle_seed % favorites.len().max(1)).copied().or_else(|| self.covers.iter().position(Option::is_some))
+    }
+
     fn favorite_games(&self) -> Vec<usize> {
         (0..self.games.len()).filter(|&i| self.favorites.contains(&self.games[i].path)).collect()
     }
@@ -2798,12 +2857,9 @@ impl Hub {
                             view.open_details(index, cx);
                         }),
                     )
-                    .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
-                        view.focus = Focus::Home(row, col);
-                        view.selected = Some(index);
-                        if event.click_count() >= 2 {
-                            view.play(index, cx);
-                        }
+                    // Opens the game's page, like clicking a game anywhere else.
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.show_game(index);
                         cx.notify();
                     })),
             );
@@ -2848,6 +2904,10 @@ impl Hub {
             Some(game) if emu::snap_path(game).exists() => {
                 img(emu::snap_path(game)).size_full().object_fit(ObjectFit::Cover).into_any_element()
             }
+            // No art at all (not even a cover): EmuHub's banner rather than a letter tile on a plain background.
+            Some(_) if hero_index.is_some_and(|i| self.covers[i].is_none()) => {
+                self.banner_art()
+            }
             // No screenshot yet: show the whole box, centered, rather than a stretched crop of it.
             Some(_) => div()
                 .size_full()
@@ -2857,7 +2917,7 @@ impl Hub {
                 .bg(rgba(0x00000040))
                 .child(div().w(px(180.)).h(px(270.)).rounded(self.cover_corners()).overflow_hidden().child(self.cover(hero_index.unwrap(), 180.)))
                 .into_any_element(),
-            None => img("banner.png").size_full().object_fit(ObjectFit::Cover).into_any_element(),
+            None => self.banner_art(),
         };
         let (title, facts) = match hero {
             Some(game) => (
@@ -2894,10 +2954,12 @@ impl Hub {
                 div().text_color(rgb(MUTED)).text_center().child("Games you play show up here. Pick one from All games to start."),
             ),
         };
+        // The hero stays solid; the rows below are see-through to the window's background, like the library.
         let hero = div()
             .flex()
             .h(px(300.))
             .flex_none()
+            .bg(self.appearance.fill(0x0c1417))
             .child(div().w(relative(0.6)).h_full().overflow_hidden().child(hero_art))
             .child(
                 div()
@@ -2961,7 +3023,6 @@ impl Hub {
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.home_page_scroll)
-            .bg(self.appearance.fill(0x0c1417))
             .flex()
             .flex_col()
             .child(hero)
@@ -3083,7 +3144,11 @@ impl Render for Hub {
             appearance::Backdrop::Solid => (None, None),
             appearance::Backdrop::Color => (self.ambient_tint(cx), None),
             // The game page draws its own faded cover.
-            appearance::Backdrop::Cover => (None, self.ambient_cover().filter(|_| self.details.is_none())),
+            // With no cover to show yet, EmuHub's own banner, like Home's hero before anything is played.
+            appearance::Backdrop::Cover if self.details.is_none() => {
+                (None, Some(self.ambient_cover().map(ImageSource::from).unwrap_or_else(|| self.banner.clone().into())))
+            }
+            appearance::Backdrop::Cover => (None, None),
         };
         let on_page = match self.focus {
             Focus::Menu(i) => i < self.menu().len(),
@@ -3109,7 +3174,6 @@ impl Render for Hub {
         }
         let page = match self.view {
             _ if !self.scanned => self.skeleton_page(),
-            View::Home if self.selected.is_some() => div().id("home-split").size_full().flex().child(self.home_page(cx).flex_1().min_w_0()).child(self.game_panel(cx)),
             View::Home => self.home_page(cx),
             View::Library => self.library_page(&visible, cx),
         };

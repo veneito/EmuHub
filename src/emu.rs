@@ -28,6 +28,9 @@ pub struct System {
     /// TheGamesDB platform id, so art searches only match this system's games; 0 searches every platform.
     #[serde(default)]
     pub tgdb: u32,
+    /// LaunchBox Games DB platform name ("Nintendo Game Boy Advance"); empty if LaunchBox has none.
+    #[serde(default)]
+    pub launchbox: String,
 }
 
 impl System {
@@ -1133,7 +1136,169 @@ pub fn install_retroarch() -> Result<(), String> {
     }
 }
 
+// ---- LaunchBox Games DB ----------------------------------------------------------
+//
+// LaunchBox publishes its whole games database as one zip (no API, no key). EmuHub downloads it once from
+// Settings, keeps only the art file names for the platforms in systems.json (one small index per platform),
+// and deletes the zip. Images then come straight from images.launchbox-app.com.
+
+const LAUNCHBOX_ZIP: &str = "https://gamesdb.launchbox-app.com/Metadata.zip";
+const LAUNCHBOX_IMAGES: &str = "https://images.launchbox-app.com/";
+/// Images kept per kind per game: enough choices on the game page without a big index.
+const LAUNCHBOX_PER_KIND: usize = 6;
+
+fn launchbox_dir() -> PathBuf {
+    config_dir().join("launchbox")
+}
+
+/// One platform's games: names (and alternate names) squashed by `match_key`, and each game's art file names.
+#[derive(Serialize, Deserialize, Default)]
+struct LaunchBoxIndex {
+    names: std::collections::HashMap<String, u64>,
+    covers: std::collections::HashMap<u64, Vec<String>>,
+    logos: std::collections::HashMap<u64, Vec<String>>,
+    heroes: std::collections::HashMap<u64, Vec<String>>,
+}
+
+/// A name for matching: region tags dropped, lowercase letters and digits only ("Advance Wars (USA)" -> "advancewars").
+fn match_key(name: &str) -> String {
+    search_title(name).chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// When the LaunchBox index was built (unix seconds), or None if it was never downloaded.
+pub fn launchbox_updated() -> Option<u64> {
+    std::fs::read_to_string(launchbox_dir().join("updated")).ok()?.trim().parse().ok()
+}
+
+/// Downloads LaunchBox's database and rebuilds the per-platform indexes. Takes a minute or two; run it in the background.
+pub fn update_launchbox() -> Result<usize, String> {
+    let dir = launchbox_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Streamed to disk: the zip is ~110 MB, too big to hold in memory.
+    let zip_path = dir.join("Metadata.zip.part");
+    let response = ureq::get(LAUNCHBOX_ZIP).call().map_err(|e| format!("Could not download the LaunchBox database: {e}"))?;
+    let mut file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
+    std::io::copy(&mut response.into_reader(), &mut file).map_err(|e| format!("Could not download the LaunchBox database: {e}"))?;
+    drop(file);
+    let result = (|| {
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let xml = archive.by_name("Metadata.xml").map_err(|e| e.to_string())?;
+        let platforms: Vec<String> = systems().into_iter().map(|s| s.launchbox).filter(|p| !p.is_empty()).collect();
+        let indexes = read_launchbox(std::io::BufReader::new(xml), &platforms);
+        let count = indexes.values().map(|i| i.covers.len()).sum();
+        for (platform, index) in indexes {
+            write_atomic(&dir.join(format!("{}.json", thumb_name(&platform))), &serde_json::to_vec(&index).unwrap())?;
+        }
+        write_atomic(&dir.join("updated"), now().to_string().as_bytes())?;
+        Ok(count)
+    })();
+    let _ = std::fs::remove_file(&zip_path);
+    // Old indexes held in memory are stale now.
+    LAUNCHBOX_CACHE.lock().unwrap().clear();
+    result
+}
+
+/// Reads Metadata.xml line by line: games come first (name, id, platform), then alternate names, then images.
+// shortcut: relies on LaunchBox writing one element per line, as Metadata.xml always has; use an XML parser if that changes.
+fn read_launchbox(xml: impl std::io::BufRead, platforms: &[String]) -> std::collections::HashMap<String, LaunchBoxIndex> {
+    let mut indexes: std::collections::HashMap<String, LaunchBoxIndex> = platforms.iter().map(|p| (p.clone(), LaunchBoxIndex::default())).collect();
+    // Which platform each wanted game is on.
+    let mut platform_of: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let (mut name, mut alt, mut id, mut platform, mut file, mut kind) = (String::new(), String::new(), 0u64, String::new(), String::new(), String::new());
+    for line in xml.lines().map_while(Result::ok) {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix('<') else { continue };
+        match rest {
+            // A new element: nothing carries over from the last one.
+            "Game>" | "GameAlternateName>" | "GameImage>" => (name, alt, id, platform, file, kind) = Default::default(),
+            "/Game>" => {
+                if indexes.contains_key(&platform) {
+                    indexes.get_mut(&platform).unwrap().names.entry(match_key(&name)).or_insert(id);
+                    platform_of.insert(id, platform.clone());
+                }
+            }
+            "/GameAlternateName>" => {
+                if let Some(index) = platform_of.get(&id).and_then(|p| indexes.get_mut(p)) {
+                    index.names.entry(match_key(&alt)).or_insert(id);
+                }
+            }
+            "/GameImage>" => {
+                if let Some(index) = platform_of.get(&id).and_then(|p| indexes.get_mut(p)) {
+                    let list = match kind.as_str() {
+                        "Box - Front" | "Box - Front - Reconstructed" => Some(&mut index.covers),
+                        "Clear Logo" => Some(&mut index.logos),
+                        "Fanart - Background" => Some(&mut index.heroes),
+                        _ => None,
+                    };
+                    if let Some(files) = list.map(|l| l.entry(id).or_default()).filter(|f| f.len() < LAUNCHBOX_PER_KIND) {
+                        files.push(file.clone());
+                    }
+                }
+            }
+            _ => {
+                let Some((tag, value)) = rest.split_once('>').and_then(|(tag, rest)| Some((tag, rest.strip_suffix(&format!("</{tag}>"))?))) else { continue };
+                let value = xml_unescape(value);
+                match tag {
+                    "Name" => name = value,
+                    "AlternateName" => alt = value,
+                    "DatabaseID" => id = value.parse().unwrap_or(0),
+                    "Platform" => platform = value,
+                    "FileName" => file = value,
+                    "Type" => kind = value,
+                    _ => {}
+                }
+            }
+        }
+    }
+    indexes
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+/// Indexes loaded so far, by platform: read once from disk, then shared by every lookup.
+static LAUNCHBOX_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<LaunchBoxIndex>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn launchbox_index(platform: &str) -> Option<std::sync::Arc<LaunchBoxIndex>> {
+    if platform.is_empty() {
+        return None;
+    }
+    let mut cache = LAUNCHBOX_CACHE.lock().unwrap();
+    if let Some(index) = cache.get(platform) {
+        return Some(index.clone());
+    }
+    let bytes = std::fs::read(launchbox_dir().join(format!("{}.json", thumb_name(platform)))).ok()?;
+    let index = std::sync::Arc::new(serde_json::from_slice::<LaunchBoxIndex>(&bytes).ok()?);
+    cache.insert(platform.to_owned(), index.clone());
+    Some(index)
+}
+
+/// Full image URLs of LaunchBox's art of one kind for the game (LaunchBox has no icons).
+fn launchbox_art(game: &Game, sys: &System, kind: Art) -> Vec<String> {
+    let Some(index) = launchbox_index(&sys.launchbox) else { return vec![] };
+    let Some(id) = index.names.get(&match_key(&game.name)) else { return vec![] };
+    let files = match kind {
+        Art::Cover => index.covers.get(id),
+        Art::Logo => index.logos.get(id),
+        Art::Hero => index.heroes.get(id),
+        Art::Icon => None,
+    };
+    files.into_iter().flatten().map(|f| format!("{LAUNCHBOX_IMAGES}{f}")).collect()
+}
+
 // ---- cover art ------------------------------------------------------------
+
+/// EmuHub's own banner as a file, written once: images load reliably from files, like the covers.
+pub fn banner_path() -> PathBuf {
+    let path = config_dir().join("banner.png");
+    if !path.exists() {
+        // Best effort: without it the page just shows its plain background.
+        let _ = write_atomic(&path, include_bytes!("../assets/banner.png"));
+    }
+    path
+}
 
 /// The kinds of game art, named like SteamGridDB's: grids (covers), heroes (wide banners), logos and icons.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1219,8 +1384,8 @@ fn steam_art_url(game: &Game, kind: Art) -> Option<String> {
     Some(format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/{file}"))
 }
 
-/// Downloads a game's hero, logo or icon from the first source that has one: Steam's own, TheGamesDB, then
-/// SteamGridDB. Returns true if it now exists. A miss is remembered so it's only tried once.
+/// Downloads a game's hero, logo or icon from the first source that has one: Steam's own, LaunchBox, TheGamesDB,
+/// then SteamGridDB. Returns true if it now exists. A miss is remembered so it's only tried once.
 pub fn fetch_art(game: &Game, kind: Art, steamgriddb_key: &str, thegamesdb_key: &str) -> bool {
     if art_path(game, kind).exists() {
         return true;
@@ -1231,6 +1396,9 @@ pub fn fetch_art(game: &Game, kind: Art, steamgriddb_key: &str, thegamesdb_key: 
     }
     let Some(sys) = systems().into_iter().find(|s| s.id == game.system) else { return false };
     let mut bytes = steam_art_url(game, kind).and_then(|url| download(&url, None).ok());
+    if bytes.is_none() {
+        bytes = launchbox_art(game, &sys, kind).first().and_then(|url| download(url, None).ok());
+    }
     if bytes.is_none() && !thegamesdb_key.is_empty() {
         match tgdb_art(thegamesdb_key, game, &sys, kind) {
             Ok(found) => bytes = found.first().and_then(|(_, url)| download(url, None).ok()),
@@ -1469,6 +1637,9 @@ pub fn fetch_cover(game: &Game, steamgriddb_key: &str, thegamesdb_key: &str) -> 
             bytes = download(&libretro_url(&sys, best), None).ok();
         }
     }
+    if bytes.is_none() {
+        bytes = launchbox_art(game, &sys, Art::Cover).first().and_then(|url| download(url, None).ok());
+    }
     if bytes.is_none() && !thegamesdb_key.is_empty() {
         match tgdb_art(thegamesdb_key, game, &sys, Art::Cover) {
             Ok(found) => bytes = found.first().and_then(|(_, url)| download(url, None).ok()),
@@ -1515,6 +1686,7 @@ pub fn art_candidates(game: &Game, kind: Art, steamgriddb_key: &str, thegamesdb_
     if let Some(url) = steam_art_url(game, kind) {
         options.push((url.clone(), url, "Steam".to_owned()));
     }
+    options.extend(launchbox_art(game, &sys, kind).into_iter().map(|url| (url.clone(), url, "LaunchBox".to_owned())));
     if !thegamesdb_key.is_empty() {
         let found = tgdb_art(thegamesdb_key, game, &sys, kind).unwrap_or_default();
         options.extend(found.into_iter().take(12).map(|(thumb, url)| (thumb, url, "TheGamesDB".to_owned())));
@@ -1750,6 +1922,53 @@ mod tests {
         );
         assert_eq!(super::tgdb_image_urls(&reply, 140, "clearlogo").len(), 1);
         assert!(super::tgdb_image_urls(&reply, 140, "fanart").is_empty());
+    }
+
+    #[test]
+    fn reads_launchbox_metadata() {
+        let xml = r#"<?xml version="1.0" standalone="yes"?>
+<LaunchBox>
+  <Game>
+    <Name>Advance Wars</Name>
+    <Overview>Two lines
+of text.</Overview>
+    <DatabaseID>140</DatabaseID>
+    <Platform>Nintendo Game Boy Advance</Platform>
+  </Game>
+  <Game>
+    <Name>Halo: Combat Evolved</Name>
+    <DatabaseID>1</DatabaseID>
+    <Platform>Microsoft Xbox</Platform>
+  </Game>
+  <GameAlternateName>
+    <AlternateName>Advance Wars &amp; Friends</AlternateName>
+    <DatabaseID>140</DatabaseID>
+  </GameAlternateName>
+  <GameImage>
+    <DatabaseID>140</DatabaseID>
+    <FileName>a.jpg</FileName>
+    <Type>Box - Front</Type>
+  </GameImage>
+  <GameImage>
+    <DatabaseID>140</DatabaseID>
+    <FileName>b.png</FileName>
+    <Type>Clear Logo</Type>
+  </GameImage>
+  <GameImage>
+    <DatabaseID>1</DatabaseID>
+    <FileName>c.jpg</FileName>
+    <Type>Box - Front</Type>
+  </GameImage>
+</LaunchBox>"#;
+        let indexes = super::read_launchbox(std::io::Cursor::new(xml), &["Nintendo Game Boy Advance".to_owned()]);
+        let gba = &indexes["Nintendo Game Boy Advance"];
+        assert_eq!(gba.names.get(&super::match_key("Advance Wars (USA) (Rev 1)")), Some(&140));
+        assert_eq!(gba.names.get("advancewarsfriends"), Some(&140));
+        assert_eq!(gba.covers[&140], ["a.jpg"]);
+        assert_eq!(gba.logos[&140], ["b.png"]);
+        // Xbox wasn't asked for, so its game and image are skipped.
+        assert_eq!(gba.covers.len(), 1);
+        assert!(!indexes.contains_key("Microsoft Xbox"));
     }
 
     #[test]
