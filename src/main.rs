@@ -544,6 +544,8 @@ impl Hub {
         // Keep the selected game selected (and so its background) when it's still there.
         let selected = self.selected.map(|i| self.games[i].path.clone());
         self.games = emu::scan(&self.config.roms_dir, &self.systems);
+        self.games.extend(emu::steam_games());
+        self.games.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         self.refresh_covers();
         self.selected = selected.and_then(|path| self.games.iter().position(|g| g.path == path));
         if self.system.as_deref().is_some_and(|s| s != FAVORITES && !self.games.iter().any(|g| g.system == s)) {

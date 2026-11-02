@@ -330,12 +330,21 @@ fn zapper_game(game: &Game) -> bool {
 
 /// Starts a game in RetroArch or its standalone emulator.
 pub fn launch(cfg: &Config, game: &Game) -> Result<Running, String> {
+    if game.system == STEAM {
+        return launch_steam(game);
+    }
     let sys = systems().into_iter().find(|s| s.id == game.system).ok_or("unknown system")?;
     if let Some(emu) = emulator(&sys.standalone) {
         let mut running = launch_standalone(cfg, emu, game)?;
         running.game = Some(game.path.clone());
         record_play(game);
         return Ok(running);
+    }
+    if sys.core == "melondsds" {
+        for dir in retroarch_save_dirs(cfg) {
+            // Best effort: a failed copy only means the game starts without its old save.
+            let _ = move_melonds_save(&dir, game);
+        }
     }
     let zapper = zapper_game(game);
     let core = cfg.cores_dir.join(core_file(if zapper { ZAPPER_CORE } else { &sys.core }));
@@ -345,6 +354,31 @@ pub fn launch(cfg: &Config, game: &Game) -> Result<Running, String> {
     let child = retroarch(cfg, zapper)?.arg("-L").arg(core).arg(&game.path).spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
     record_play(game);
     Ok(Running { child, close_on_combo: false, game: Some(game.path.clone()), started: std::time::Instant::now() })
+}
+
+/// Folders RetroArch may keep saves in: EmuDeck's (retroarch_overrides points there when it exists),
+/// then RetroArch's default next to its config.
+// shortcut: a savefile_directory changed in RetroArch's own settings isn't read; parse retroarch.cfg if people hit that.
+fn retroarch_save_dirs(cfg: &Config) -> Vec<PathBuf> {
+    let mut dirs = vec![emulation_dir(cfg).join("saves/retroarch/saves")];
+    if let Some(exe) = cfg.retroarch_cmd.first().map(Path::new).filter(|p| p.is_absolute()) {
+        dirs.extend(exe.parent().map(|d| d.join("saves")));
+    }
+    dirs.push(home().join(".var/app/org.libretro.RetroArch/config/retroarch/saves"));
+    dirs.push(home().join(".config/retroarch/saves"));
+    dirs.into_iter().filter(|d| d.is_dir()).collect()
+}
+
+/// The old melonDS core saved to melonDS/<game>.sav; melonDS DS reads melonDS DS/<game>.srm. Both are raw
+/// DS save data, so the old save is copied over once. Never overwrites a melonDS DS save.
+fn move_melonds_save(saves: &Path, game: &Game) -> Result<(), String> {
+    let stem = game.path.file_stem().unwrap_or_default().to_string_lossy();
+    let (old, new) = (saves.join("melonDS").join(format!("{stem}.sav")), saves.join("melonDS DS").join(format!("{stem}.srm")));
+    if old.is_file() && !new.exists() {
+        std::fs::create_dir_all(new.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::copy(&old, &new).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// RetroArch, fullscreen, with EmuHub's settings for this run (see retroarch_overrides).
@@ -364,6 +398,72 @@ input_player2_gun_trigger_mbtn = \"1\"
     let mut command = start(Path::new(exe));
     command.args(args).arg("--fullscreen").arg("--appendconfig").arg(file);
     Ok(command)
+}
+
+// ---- Steam -----------------------------------------------------------------
+
+/// The systems.json id for installed Steam games. Their path is the game's appmanifest_<appid>.acf.
+pub const STEAM: &str = "steam";
+
+/// Steam's own folder, holding steamapps/libraryfolders.vdf.
+fn steam_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        // shortcut: Steam's default folder only; read HKCU\Software\Valve\Steam\SteamPath if people install it elsewhere.
+        PathBuf::from(r"C:\Program Files (x86)\Steam")
+    } else if cfg!(target_os = "macos") {
+        home().join("Library/Application Support/Steam")
+    } else {
+        home().join(".local/share/Steam")
+    }
+}
+
+/// Every value of `key` in a Valve KeyValues (.vdf/.acf) file, e.g. each library's "path".
+fn vdf_values(text: &str, key: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.trim().split('"').collect();
+            // A key-value line splits into ["", key, gap, value, ""].
+            (parts.len() == 5 && parts[1] == key).then(|| parts[3].replace(r"\\", r"\"))
+        })
+        .collect()
+}
+
+/// Installed Steam games from every Steam library, without Steam's own tools (Proton, runtimes, redistributables).
+pub fn steam_games() -> Vec<Game> {
+    let Ok(folders) = std::fs::read_to_string(steam_dir().join("steamapps/libraryfolders.vdf")) else { return Vec::new() };
+    let mut games = Vec::new();
+    for library in vdf_values(&folders, "path") {
+        let Ok(entries) = std::fs::read_dir(Path::new(&library).join("steamapps")) else { continue };
+        for path in entries.flatten().map(|e| e.path()) {
+            let file = path.file_name().unwrap_or_default().to_string_lossy();
+            if !(file.starts_with("appmanifest_") && file.ends_with(".acf")) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Some(name) = vdf_values(&text, "name").into_iter().next() else { continue };
+            if ["Proton", "Steam Linux Runtime", "Steamworks"].iter().any(|tool| name.starts_with(tool)) {
+                continue;
+            }
+            games.push(Game { system: STEAM.to_owned(), name, path });
+        }
+    }
+    games
+}
+
+/// The Steam app id from a Steam game's path (appmanifest_413150.acf → 413150).
+fn steam_appid(game: &Game) -> Option<String> {
+    let stem = game.path.file_stem()?.to_str()?;
+    stem.strip_prefix("appmanifest_").map(str::to_owned)
+}
+
+/// Asks Steam to start the game.
+// shortcut: the opener exits right away, so play time isn't tracked and the close combo does nothing; track the game's process if that matters.
+fn launch_steam(game: &Game) -> Result<Running, String> {
+    let appid = steam_appid(game).ok_or("Not a Steam game")?;
+    let opener = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let child = Command::new(opener).arg(format!("steam://rungameid/{appid}")).spawn().map_err(|e| format!("Could not start Steam: {e}"))?;
+    record_play(game);
+    Ok(Running { child, close_on_combo: false, game: None, started: std::time::Instant::now() })
 }
 
 // ---- standalone emulators --------------------------------------------------
@@ -866,6 +966,12 @@ pub fn fetch_cover(game: &Game, steamgriddb_key: &str) -> bool {
         return false;
     }
     let Some(sys) = systems().into_iter().find(|s| s.id == game.system) else { return false };
+    if let Some(appid) = steam_appid(game).filter(|_| game.system == STEAM) {
+        // Steam's own portrait cover; SteamGridDB below if a game has none.
+        if let Ok(bytes) = download(&format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"), None) {
+            return write_atomic(&default_cover(game), &shrink_cover(&bytes)).is_ok();
+        }
+    }
     let mut bytes = if sys.thumbs.is_empty() { None } else { download(&libretro_url(&sys, &thumb_name(&game.name)), None).ok() };
     if bytes.is_none() && !sys.thumbs.is_empty() {
         if let Some(best) = libretro_matches(game, &libretro_names(&sys)).first() {
@@ -1029,6 +1135,41 @@ pub fn fetch_snap(game: &Game) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copies_old_melonds_save_once() {
+        let dir = std::env::temp_dir().join("emuhub_melonds_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("melonDS")).unwrap();
+        std::fs::write(dir.join("melonDS/Fire Emblem.sav"), b"old").unwrap();
+        let game = super::Game { system: "nds".into(), name: "Fire Emblem".into(), path: "roms/nds/Fire Emblem.nds".into() };
+        super::move_melonds_save(&dir, &game).unwrap();
+        assert_eq!(std::fs::read(dir.join("melonDS DS/Fire Emblem.srm")).unwrap(), b"old");
+        // A newer melonDS DS save is kept.
+        std::fs::write(dir.join("melonDS DS/Fire Emblem.srm"), b"new").unwrap();
+        super::move_melonds_save(&dir, &game).unwrap();
+        assert_eq!(std::fs::read(dir.join("melonDS DS/Fire Emblem.srm")).unwrap(), b"new");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reads_vdf_values() {
+        let vdf = r#""libraryfolders"
+{
+	"0"
+	{
+		"path"		"C:\\Program Files (x86)\\Steam"
+		"apps"
+	}
+	"1"
+	{
+		"path"		"D:\\SteamLibrary"
+	}
+}"#;
+        assert_eq!(super::vdf_values(vdf, "path"), [r"C:\Program Files (x86)\Steam", r"D:\SteamLibrary"]);
+        let game = super::Game { system: "steam".into(), name: "Stardew Valley".into(), path: "x/appmanifest_413150.acf".into() };
+        assert_eq!(super::steam_appid(&game).as_deref(), Some("413150"));
+    }
+
     use super::*;
 
     #[test]
