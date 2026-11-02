@@ -25,6 +25,9 @@ pub struct System {
     /// Other cores or standalone emulator ids a game can be set to use instead, on its game page.
     #[serde(default)]
     pub alts: Vec<String>,
+    /// TheGamesDB platform id, so art searches only match this system's games; 0 searches every platform.
+    #[serde(default)]
+    pub tgdb: u32,
 }
 
 impl System {
@@ -84,6 +87,9 @@ pub struct Config {
     /// Optional SteamGridDB API key, used for covers libretro-thumbnails doesn't have.
     #[serde(default)]
     pub steamgriddb_key: String,
+    /// Optional TheGamesDB API key: retro box art, backgrounds and logos.
+    #[serde(default)]
+    pub thegamesdb_key: String,
     /// Standalone emulator programs picked in Settings, by emulator id.
     #[serde(default)]
     pub emulators: std::collections::HashMap<String, PathBuf>,
@@ -152,13 +158,14 @@ fn default_config(home: &Path) -> Config {
     let steamgriddb_key = String::new();
     if cfg!(target_os = "windows") {
         let ra = PathBuf::from(r"C:\RetroArch-Win64");
-        Config { roms_dir, retroarch_cmd: vec![ra.join("retroarch.exe").display().to_string()], cores_dir: ra.join("cores"), steamgriddb_key, emulators: Default::default(), skipped_update: None, hide_steam: false, pc_folders: Vec::new() }
+        Config { roms_dir, retroarch_cmd: vec![ra.join("retroarch.exe").display().to_string()], cores_dir: ra.join("cores"), steamgriddb_key, thegamesdb_key: String::new(), emulators: Default::default(), skipped_update: None, hide_steam: false, pc_folders: Vec::new() }
     } else if cfg!(target_os = "macos") {
         Config {
             roms_dir,
             retroarch_cmd: vec!["/Applications/RetroArch.app/Contents/MacOS/RetroArch".into()],
             cores_dir: home.join("Library/Application Support/RetroArch/cores"),
             steamgriddb_key,
+            thegamesdb_key: String::new(),
             emulators: Default::default(),
             skipped_update: None,
             hide_steam: false,
@@ -171,6 +178,7 @@ fn default_config(home: &Path) -> Config {
             retroarch_cmd: vec!["flatpak".into(), "run".into(), "org.libretro.RetroArch".into()],
             cores_dir: home.join(".var/app/org.libretro.RetroArch/config/retroarch/cores"),
             steamgriddb_key,
+            thegamesdb_key: String::new(),
             emulators: Default::default(),
             skipped_update: None,
             hide_steam: false,
@@ -336,11 +344,53 @@ pub struct Running {
     /// The game being played, for its play time; None when RetroArch was opened on its own.
     game: Option<PathBuf>,
     started: std::time::Instant,
+    /// PC games: the game counts as open while any program from this folder runs, like Playnite's
+    /// folder tracking. Covers launchers and shortcuts that exit once the real game starts.
+    folder: Option<PathBuf>,
+    /// When the folder was last checked and whether a program from it was running.
+    folder_check: Option<(std::time::Instant, bool)>,
 }
 
+/// Whether any running program's file is inside `folder`.
+fn program_running_in(folder: &Path) -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet));
+    system.processes().values().any(|p| p.exe().is_some_and(|exe| exe.starts_with(folder)))
+}
+
+/// A folder narrow enough to stand for one game: not a drive root or a top-level folder like C:\Games.
+fn game_folder(program: &Path) -> Option<PathBuf> {
+    let dir = program.parent()?;
+    (dir.components().count() >= 3).then(|| dir.to_path_buf())
+}
+
+/// How long a launcher gets to start the game before the folder check can end the session.
+const LAUNCH_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Listing every process takes tens of milliseconds, so the folder is checked this often at most.
+const FOLDER_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl Running {
+    fn new(child: std::process::Child, close_on_combo: bool, game: Option<PathBuf>) -> Self {
+        Running { child, close_on_combo, game, started: std::time::Instant::now(), folder: None, folder_check: None }
+    }
+
     pub fn is_open(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        if matches!(self.child.try_wait(), Ok(None)) {
+            return true;
+        }
+        let Some(folder) = &self.folder else { return false };
+        if self.started.elapsed() < LAUNCH_GRACE {
+            return true;
+        }
+        match self.folder_check {
+            Some((at, running)) if at.elapsed() < FOLDER_CHECK_EVERY => running,
+            _ => {
+                let running = program_running_in(folder);
+                self.folder_check = Some((std::time::Instant::now(), running));
+                running
+            }
+        }
     }
 
     /// Adds this session to the game's play time. Call once, after the emulator closed.
@@ -411,7 +461,7 @@ pub fn launch(cfg: &Config, game: &Game) -> Result<Running, String> {
     }
     let child = retroarch(cfg, zapper)?.arg("-L").arg(core).arg(&game.path).spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
     record_play(game);
-    Ok(Running { child, close_on_combo: false, game: Some(game.path.clone()), started: std::time::Instant::now() })
+    Ok(Running::new(child, false, Some(game.path.clone())))
 }
 
 /// Folders RetroArch may keep saves in: EmuDeck's (retroarch_overrides points there when it exists),
@@ -560,25 +610,107 @@ fn main_exe(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Starts a PC game: a program directly (from its own folder, so it finds its files), anything else with the system opener.
-/// `chosen` is a program picked on the game page instead of the one found.
+/// `chosen` is a program picked on the game page instead of the one found. A .lnk shortcut to a program
+/// starts that program directly, so it's tracked like one.
 fn launch_pc(game: &Game, chosen: Option<&Path>) -> Result<Running, String> {
     let path = chosen.unwrap_or(&game.path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    let program = (cfg!(target_os = "windows") && ext == "exe") || ext == "appimage";
-    let child = if program {
-        Command::new(path).current_dir(path.parent().unwrap_or(Path::new("."))).spawn()
-    } else {
-        let opener = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        Command::new(opener).arg(path).spawn()
+    let shortcut = (ext == "lnk").then(|| std::fs::read(path).ok().and_then(|b| parse_lnk(&b))).flatten();
+    let (program, args, dir) = match shortcut {
+        Some(link) => (Some(link.target), link.args, link.dir),
+        None if (cfg!(target_os = "windows") && ext == "exe") || ext == "appimage" => (Some(path.to_path_buf()), String::new(), None),
+        None => (None, String::new(), None),
+    };
+    let child = match &program {
+        Some(program) => {
+            let mut command = Command::new(program);
+            command.current_dir(dir.as_deref().or(program.parent()).unwrap_or(Path::new(".")));
+            // A shortcut's arguments are one Windows command line; passed as-is so its quoting survives.
+            #[cfg(windows)]
+            std::os::windows::process::CommandExt::raw_arg(&mut command, &args);
+            #[cfg(not(windows))]
+            command.args(args.split_whitespace());
+            command.spawn()
+        }
+        None => {
+            let opener = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+            Command::new(opener).arg(path).spawn()
+        }
     }
     .map_err(|e| format!("Could not start {}: {e}", game.name))?;
     record_play(game);
-    // Only a program started here is tracked; a shortcut's opener exits right away.
-    Ok(Running { child, close_on_combo: program, game: program.then(|| game.path.clone()), started: std::time::Instant::now() })
+    // shortcut: .url and other links have no folder to watch, so their play time isn't tracked.
+    let mut running = Running::new(child, program.is_some(), program.is_some().then(|| game.path.clone()));
+    running.folder = program.as_deref().and_then(game_folder);
+    Ok(running)
+}
+
+/// What a Windows .lnk shortcut starts.
+#[derive(Debug, PartialEq)]
+struct Link {
+    target: PathBuf,
+    args: String,
+    dir: Option<PathBuf>,
+}
+
+/// Reads a .lnk file (MS-SHLLINK): the target from LinkInfo's local path, then the working folder and
+/// arguments from the string section. None for links without a local path (shell folders, URLs).
+fn parse_lnk(bytes: &[u8]) -> Option<Link> {
+    let u16_at = |i: usize| bytes.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
+    let u32_at = |i: usize| bytes.get(i..i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    if u32_at(0)? != 0x4c {
+        return None;
+    }
+    let flags = u32_at(0x14)?;
+    let unicode = flags & 0x80 != 0;
+    let mut pos = 0x4c;
+    if flags & 0x1 != 0 {
+        pos += 2 + u16_at(pos)?; // LinkTargetIDList
+    }
+    if flags & 0x2 == 0 {
+        return None;
+    }
+    let info = pos;
+    let info_size = u32_at(info)?;
+    let header_size = u32_at(info + 4)?;
+    // Unicode path when the header has one (size >= 0x24), else the ANSI one.
+    let target = if header_size >= 0x24 {
+        utf16_z(bytes, info + u32_at(info + 0x1c)?)?
+    } else {
+        let start = info + u32_at(info + 0x10)?;
+        let end = start + bytes.get(start..)?.iter().position(|&b| b == 0)?;
+        String::from_utf8_lossy(&bytes[start..end]).into_owned()
+    };
+    pos = info + info_size;
+    // StringData, in this order: NAME, RELATIVE_PATH, WORKING_DIR, ARGUMENTS.
+    let mut strings = [None, None, None, None];
+    for (i, flag) in [0x4, 0x8, 0x10, 0x20].into_iter().enumerate() {
+        if flags & flag == 0 {
+            continue;
+        }
+        let count = u16_at(pos)?;
+        pos += 2;
+        let len = if unicode { count * 2 } else { count };
+        let raw = bytes.get(pos..pos + len)?;
+        strings[i] = Some(if unicode {
+            String::from_utf16_lossy(&raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>())
+        } else {
+            String::from_utf8_lossy(raw).into_owned()
+        });
+        pos += len;
+    }
+    let [_, _, dir, args] = strings;
+    (!target.is_empty()).then(|| Link { target: PathBuf::from(target), args: args.unwrap_or_default(), dir: dir.filter(|d| !d.is_empty()).map(PathBuf::from) })
+}
+
+/// A NUL-terminated UTF-16 string starting at `start`.
+fn utf16_z(bytes: &[u8], start: usize) -> Option<String> {
+    let units: Vec<u16> = bytes.get(start..)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+    Some(String::from_utf16_lossy(&units))
 }
 
 /// The Steam app id from a Steam game's path (appmanifest_413150.acf → 413150).
-fn steam_appid(game: &Game) -> Option<String> {
+pub fn steam_appid(game: &Game) -> Option<String> {
     if !game.path.extension().is_some_and(|e| e == "acf") {
         return None;
     }
@@ -586,14 +718,63 @@ fn steam_appid(game: &Game) -> Option<String> {
     stem.strip_prefix("appmanifest_").map(str::to_owned)
 }
 
-/// Asks Steam to start the game.
-// shortcut: the opener exits right away, so play time isn't tracked and the close combo does nothing; track the game's process if that matters.
+/// Asks Steam to start the game. Steam keeps its own play time (see steam_play_stats), so EmuHub only
+/// watches the game's install folder to know it's still running.
 fn launch_steam(game: &Game) -> Result<Running, String> {
     let appid = steam_appid(game).ok_or("Not a Steam game")?;
     let opener = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     let child = Command::new(opener).arg(format!("steam://rungameid/{appid}")).spawn().map_err(|e| format!("Could not start Steam: {e}"))?;
     record_play(game);
-    Ok(Running { child, close_on_combo: false, game: None, started: std::time::Instant::now() })
+    let mut running = Running::new(child, false, None);
+    // appmanifest_<id>.acf sits in steamapps/; the game is in steamapps/common/<installdir>.
+    let installdir = std::fs::read_to_string(&game.path).ok().and_then(|t| vdf_values(&t, "installdir").into_iter().next());
+    running.folder = installdir.and_then(|d| Some(game.path.parent()?.join("common").join(d)));
+    Ok(running)
+}
+
+/// Steam's own play time and last played time per app id, in seconds and unix seconds, from every
+/// account's localconfig.vdf (the account that played it last wins).
+pub fn steam_play_stats() -> std::collections::HashMap<String, (u64, u64)> {
+    let mut stats: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    for user in std::fs::read_dir(steam_dir().join("userdata")).into_iter().flatten().flatten() {
+        let Ok(text) = std::fs::read_to_string(user.path().join("config/localconfig.vdf")) else { continue };
+        for (appid, minutes, last) in parse_steam_play(&text) {
+            let entry = stats.entry(appid).or_default();
+            if last >= entry.1 {
+                *entry = (minutes * 60, last);
+            }
+        }
+    }
+    stats
+}
+
+/// (app id, minutes played, last played) from localconfig.vdf: an app's block starts with a line holding just
+/// its quoted id, and holds "playtime" and "LastPlayed" values.
+fn parse_steam_play(text: &str) -> Vec<(String, u64, u64)> {
+    let mut found: Vec<(String, u64, u64)> = Vec::new();
+    let mut app: Option<String> = None;
+    for line in text.lines() {
+        let parts: Vec<&str> = line.trim().split('"').collect();
+        match parts.as_slice() {
+            ["", id, ""] if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => app = Some(id.to_string()),
+            ["", key, _, value, ""] => {
+                let Some(id) = &app else { continue };
+                let Ok(value) = value.parse::<u64>() else { continue };
+                if found.last().is_none_or(|(last, _, _)| last != id) {
+                    found.push((id.clone(), 0, 0));
+                }
+                let entry = found.last_mut().unwrap();
+                if key.eq_ignore_ascii_case("playtime") {
+                    entry.1 = value;
+                } else if key.eq_ignore_ascii_case("LastPlayed") {
+                    entry.2 = value;
+                }
+            }
+            _ => {}
+        }
+    }
+    found.retain(|(_, minutes, last)| *minutes > 0 || *last > 0);
+    found
 }
 
 // ---- standalone emulators --------------------------------------------------
@@ -721,7 +902,7 @@ fn launch_standalone(cfg: &Config, emu: &Emulator, game: &Game) -> Result<Runnin
     // On macOS the child is `open -W` (it waits for the app), so closing it wouldn't close the emulator.
     // shortcut: the combo doesn't close macOS standalone emulators; quit the app by bundle id if needed.
     let mac_app = cfg!(target_os = "macos") && app_bundle(&exe).is_some();
-    Ok(Running { child, close_on_combo: !mac_app, game: None, started: std::time::Instant::now() })
+    Ok(Running::new(child, !mac_app, None))
 }
 
 // ---- play history ----------------------------------------------------------
@@ -899,7 +1080,7 @@ fn plist_version(plist: &str) -> Option<String> {
 /// Starts RetroArch on its own, e.g. to change its settings.
 pub fn open_retroarch(cfg: &Config) -> Result<Running, String> {
     let child = retroarch(cfg, false)?.spawn().map_err(|e| format!("Could not start RetroArch: {e}"))?;
-    Ok(Running { child, close_on_combo: false, game: None, started: std::time::Instant::now() })
+    Ok(Running::new(child, false, None))
 }
 
 /// Downloads every core systems.json needs that isn't already in cores_dir. Returns how many were installed.
@@ -953,6 +1134,165 @@ pub fn install_retroarch() -> Result<(), String> {
 }
 
 // ---- cover art ------------------------------------------------------------
+
+/// The kinds of game art, named like SteamGridDB's: grids (covers), heroes (wide banners), logos and icons.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Art {
+    Cover,
+    Hero,
+    Logo,
+    Icon,
+}
+
+impl Art {
+    pub const ALL: [Art; 4] = [Art::Cover, Art::Hero, Art::Logo, Art::Icon];
+
+    fn id(self) -> &'static str {
+        match self {
+            Art::Cover => "cover",
+            Art::Hero => "hero",
+            Art::Logo => "logo",
+            Art::Icon => "icon",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Art::Cover => "Cover",
+            Art::Hero => "Background",
+            Art::Logo => "Logo",
+            Art::Icon => "Icon",
+        }
+    }
+
+    /// The largest size it's drawn at, so cached files stay small.
+    fn max_size(self) -> (u32, u32) {
+        match self {
+            Art::Cover => (COVER_WIDTH, COVER_WIDTH * 3 / 2),
+            Art::Hero => (1600, 900),
+            Art::Logo => (640, 320),
+            Art::Icon => (128, 128),
+        }
+    }
+}
+
+/// The automatically downloaded hero, logo or icon.
+fn default_art(game: &Game, kind: Art) -> PathBuf {
+    cover_dir(game).join(format!("{}.{}.png", thumb_name(&game.name), kind.id()))
+}
+
+/// Where one kind of a game's art is on disk (it may not exist yet). Picked art is recorded in a ".choice" file, like covers.
+pub fn art_path(game: &Game, kind: Art) -> PathBuf {
+    if kind == Art::Cover {
+        return cover_path(game);
+    }
+    let default = default_art(game, kind);
+    match std::fs::read_to_string(default.with_extension("choice")) {
+        Ok(file) if !file.trim().is_empty() => cover_dir(game).join(file.trim()),
+        _ => default,
+    }
+}
+
+/// Scaled down to fit the kind's largest size, as PNG (logos and icons keep their transparency).
+fn shrink_art(bytes: &[u8], kind: Art) -> Vec<u8> {
+    let Ok(img) = image::load_from_memory(bytes) else { return bytes.to_vec() };
+    let (w, h) = kind.max_size();
+    if img.width() <= w && img.height() <= h {
+        return bytes.to_vec();
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    match img.resize(w, h, image::imageops::FilterType::Triangle).write_to(&mut out, image::ImageFormat::Png) {
+        Ok(()) => out.into_inner(),
+        Err(_) => bytes.to_vec(),
+    }
+}
+
+/// Steam's own art for a Steam game.
+fn steam_art_url(game: &Game, kind: Art) -> Option<String> {
+    let appid = steam_appid(game)?;
+    let file = match kind {
+        Art::Cover => "library_600x900.jpg",
+        Art::Hero => "library_hero.jpg",
+        Art::Logo => "logo.png",
+        Art::Icon => return None,
+    };
+    Some(format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/{file}"))
+}
+
+/// Downloads a game's hero, logo or icon from the first source that has one: Steam's own, TheGamesDB, then
+/// SteamGridDB. Returns true if it now exists. A miss is remembered so it's only tried once.
+pub fn fetch_art(game: &Game, kind: Art, steamgriddb_key: &str, thegamesdb_key: &str) -> bool {
+    if art_path(game, kind).exists() {
+        return true;
+    }
+    let miss = default_art(game, kind).with_extension("noart");
+    if miss.exists() {
+        return false;
+    }
+    let Some(sys) = systems().into_iter().find(|s| s.id == game.system) else { return false };
+    let mut bytes = steam_art_url(game, kind).and_then(|url| download(&url, None).ok());
+    if bytes.is_none() && !thegamesdb_key.is_empty() {
+        match tgdb_art(thegamesdb_key, game, &sys, kind) {
+            Ok(found) => bytes = found.first().and_then(|(_, url)| download(url, None).ok()),
+            Err(_) => return false, // network/API error: retry next time
+        }
+    }
+    if bytes.is_none() && !steamgriddb_key.is_empty() {
+        match steamgrid_art(steamgriddb_key, &game.name, kind) {
+            Ok(found) => bytes = found.first().and_then(|(_, url)| download(url, None).ok()),
+            Err(_) => return false,
+        }
+    }
+    match bytes {
+        Some(bytes) => write_atomic(&default_art(game, kind), &shrink_art(&bytes, kind)).is_ok(),
+        None => {
+            let _ = write_atomic(&miss, b"");
+            false
+        }
+    }
+}
+
+/// Forgets which games had no hero, logo or icon, so they're looked up again (e.g. with a new API key).
+pub fn forget_art_misses() {
+    for system in std::fs::read_dir(config_dir().join("covers")).into_iter().flatten().flatten() {
+        for file in std::fs::read_dir(system.path()).into_iter().flatten().flatten() {
+            if file.path().extension().is_some_and(|e| e == "noart" || e == "nocover") {
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
+    }
+}
+
+/// (thumbnail, full image) URLs of TheGamesDB's art of one kind for the best name match on the game's platform.
+/// TheGamesDB has no icons.
+fn tgdb_art(key: &str, game: &Game, sys: &System, kind: Art) -> Result<Vec<(String, String)>, String> {
+    let wanted = match kind {
+        Art::Cover => "boxart",
+        Art::Hero => "fanart",
+        Art::Logo => "clearlogo",
+        Art::Icon => return Ok(vec![]),
+    };
+    let get = |url: &str| -> Result<serde_json::Value, String> { serde_json::from_slice(&download(url, None)?).map_err(|e| e.to_string()) };
+    let platform = if sys.tgdb == 0 { String::new() } else { format!("&filter%5Bplatform%5D={}", sys.tgdb) };
+    let found = get(&format!("https://api.thegamesdb.net/v1.1/Games/ByGameName?apikey={key}&name={}{platform}", url_encode(search_title(&game.name))))?;
+    let Some(id) = found["data"]["games"][0]["id"].as_u64() else { return Ok(vec![]) };
+    let images = get(&format!("https://api.thegamesdb.net/v1/Games/Images?apikey={key}&games_id={id}"))?;
+    Ok(tgdb_image_urls(&images, id, wanted))
+}
+
+/// The (thumbnail, original) URLs of one image type in a TheGamesDB Games/Images reply; box art front sides only.
+fn tgdb_image_urls(images: &serde_json::Value, id: u64, wanted: &str) -> Vec<(String, String)> {
+    let base = &images["data"]["base_url"];
+    let (Some(thumb), Some(original)) = (base["thumb"].as_str(), base["original"].as_str()) else { return vec![] };
+    images["data"]["images"][id.to_string()]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|i| i["type"] == wanted && (wanted != "boxart" || i["side"] == "front"))
+        .filter_map(|i| i["filename"].as_str())
+        .map(|file| (format!("{thumb}{file}"), format!("{original}{file}")))
+        .collect()
+}
 
 /// libretro-thumbnails replaces these characters with "_" in its file names.
 fn thumb_name(name: &str) -> String {
@@ -1058,13 +1398,25 @@ fn libretro_matches(game: &Game, names: &[String]) -> Vec<String> {
 
 /// (preview, full image) URL pairs from SteamGridDB for the game's title, portrait grids only.
 fn steamgrid_grids(key: &str, name: &str) -> Result<Vec<(String, String)>, String> {
+    steamgrid_art(key, name, Art::Cover)
+}
+
+/// (thumbnail, full image) URLs of SteamGridDB's art of one kind for the best name match.
+fn steamgrid_art(key: &str, name: &str, kind: Art) -> Result<Vec<(String, String)>, String> {
     let auth = format!("Bearer {key}");
     let get = |url: &str| -> Result<serde_json::Value, String> {
         serde_json::from_slice(&download(url, Some(&auth))?).map_err(|e| e.to_string())
     };
     let found = get(&format!("https://www.steamgriddb.com/api/v2/search/autocomplete/{}", url_encode(search_title(name))))?;
     let Some(id) = found["data"][0]["id"].as_u64() else { return Ok(vec![]) };
-    let grids = get(&format!("https://www.steamgriddb.com/api/v2/grids/game/{id}?dimensions=600x900"))?;
+    let path = match kind {
+        Art::Cover => "grids/game/{id}?dimensions=600x900",
+        Art::Hero => "heroes/game/{id}",
+        Art::Logo => "logos/game/{id}",
+        Art::Icon => "icons/game/{id}",
+    }
+    .replace("{id}", &id.to_string());
+    let grids = get(&format!("https://www.steamgriddb.com/api/v2/{path}"))?;
     Ok(grids["data"]
         .as_array()
         .into_iter()
@@ -1095,7 +1447,7 @@ pub fn forget_cover_misses() {
 
 /// Downloads a cover into the cache: libretro by exact name, then libretro's closest name, then SteamGridDB
 /// if a key is set. Returns true if a cover now exists. A miss is remembered so it's only tried once.
-pub fn fetch_cover(game: &Game, steamgriddb_key: &str) -> bool {
+pub fn fetch_cover(game: &Game, steamgriddb_key: &str, thegamesdb_key: &str) -> bool {
     if cover_path(game).exists() {
         return true;
     }
@@ -1115,6 +1467,12 @@ pub fn fetch_cover(game: &Game, steamgriddb_key: &str) -> bool {
     if bytes.is_none() && !sys.thumbs.is_empty() {
         if let Some(best) = libretro_matches(game, &libretro_names(&sys)).first() {
             bytes = download(&libretro_url(&sys, best), None).ok();
+        }
+    }
+    if bytes.is_none() && !thegamesdb_key.is_empty() {
+        match tgdb_art(thegamesdb_key, game, &sys, Art::Cover) {
+            Ok(found) => bytes = found.first().and_then(|(_, url)| download(url, None).ok()),
+            Err(_) => return false, // network/API error: don't record a miss, retry next launch
         }
     }
     if bytes.is_none() && !steamgriddb_key.is_empty() {
@@ -1141,22 +1499,29 @@ pub struct Candidate {
     pub label: String,
 }
 
-/// Downloads previews of every cover option: libretro's matching regions, then SteamGridDB's grids.
-pub fn cover_candidates(game: &Game, steamgriddb_key: &str) -> Vec<Candidate> {
+/// Downloads previews of every option for one kind of art. Covers: libretro's matching regions, Steam's own,
+/// TheGamesDB's, then SteamGridDB's. Heroes, logos and icons: Steam's own, TheGamesDB's, then SteamGridDB's.
+pub fn art_candidates(game: &Game, kind: Art, steamgriddb_key: &str, thegamesdb_key: &str) -> Vec<Candidate> {
     use std::hash::{Hash, Hasher};
     let Some(sys) = systems().into_iter().find(|s| s.id == game.system) else { return vec![] };
-    let mut options: Vec<(String, String, String)> = libretro_matches(game, &libretro_names(&sys))
-        .into_iter()
-        .take(8)
-        .map(|name| {
+    let mut options: Vec<(String, String, String)> = Vec::new();
+    if kind == Art::Cover {
+        options.extend(libretro_matches(game, &libretro_names(&sys)).into_iter().take(8).map(|name| {
             let url = libretro_url(&sys, &name);
             let region = name.get(search_title(&name).len()..).unwrap_or("").trim().replace(") (", ", ");
             (url.clone(), url, region.trim_matches(['(', ')']).to_owned())
-        })
-        .collect();
+        }));
+    }
+    if let Some(url) = steam_art_url(game, kind) {
+        options.push((url.clone(), url, "Steam".to_owned()));
+    }
+    if !thegamesdb_key.is_empty() {
+        let found = tgdb_art(thegamesdb_key, game, &sys, kind).unwrap_or_default();
+        options.extend(found.into_iter().take(12).map(|(thumb, url)| (thumb, url, "TheGamesDB".to_owned())));
+    }
     if !steamgriddb_key.is_empty() {
-        let grids = steamgrid_grids(steamgriddb_key, &game.name).unwrap_or_default();
-        options.extend(grids.into_iter().take(12).map(|(thumb, url)| (thumb, url, "SteamGridDB".to_owned())));
+        let found = steamgrid_art(steamgriddb_key, &game.name, kind).unwrap_or_default();
+        options.extend(found.into_iter().take(12).map(|(thumb, url)| (thumb, url, "SteamGridDB".to_owned())));
     }
     let dir = config_dir().join("previews");
     options
@@ -1233,11 +1598,31 @@ pub fn shrink_cached_cover(path: &Path) {
     }
 }
 
-pub fn set_cover(game: &Game, url: &str) -> Result<(), String> {
-    let bytes = download(url, None)?;
+pub fn set_art(game: &Game, kind: Art, url: &str) -> Result<(), String> {
+    save_art(game, kind, &download(url, None)?)
+}
+
+/// Uses an image file from disk as one of the game's art.
+pub fn set_art_file(game: &Game, kind: Art, file: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+    image::load_from_memory(&bytes).map_err(|_| format!("{} isn't an image EmuHub can read (PNG, JPEG or WebP).", file.display()))?;
+    save_art(game, kind, &bytes)
+}
+
+fn save_art(game: &Game, kind: Art, bytes: &[u8]) -> Result<(), String> {
+    if kind == Art::Cover {
+        return save_cover(game, bytes);
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let file = format!("{}.{}.{stamp}.png", thumb_name(&game.name), kind.id());
+    write_atomic(&cover_dir(game).join(&file), &shrink_art(bytes, kind))?;
+    write_atomic(&default_art(game, kind).with_extension("choice"), file.as_bytes())
+}
+
+fn save_cover(game: &Game, bytes: &[u8]) -> Result<(), String> {
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     let file = format!("{}.{stamp}.png", thumb_name(&game.name));
-    write_atomic(&cover_dir(game).join(&file), &shrink_cover(&bytes))?;
+    write_atomic(&cover_dir(game).join(&file), &shrink_cover(bytes))?;
     write_atomic(&default_cover(game).with_extension("cover"), file.as_bytes())
 }
 
@@ -1315,6 +1700,56 @@ mod tests {
         options.insert(PathBuf::from("roms/gba/Golden Sun.gba"), super::GameOptions { name: Some("Golden Sun (EN)".into()), ..Default::default() });
         super::apply_game_options(&mut games, &options);
         assert_eq!(games.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["Advance Wars", "Golden Sun (EN)"]);
+    }
+
+    #[test]
+    fn reads_steam_play_time() {
+        let vdf = "\t\t\t\t\t\"apps\"\n\t\t\t\t\t{\n\t\t\t\t\t\"413150\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LastPlayed\"\t\t\"1768955742\"\n\t\t\t\t\t\t\"playtime\"\t\t\"5890\"\n\t\t\t\t\t\t\"cloud\"\n\t\t\t\t\t\t{\n\t\t\t\t\t\t\t\"last_sync_state\"\t\t\"synchronized\"\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n";
+        assert_eq!(super::parse_steam_play(vdf), [("413150".to_owned(), 5890, 1768955742)]);
+    }
+
+    #[test]
+    fn reads_lnk_target_and_arguments() {
+        // A minimal shortcut: header, LinkInfo with an ANSI local path, then working folder and arguments in UTF-16.
+        let target = b"C:\\Games\\Celeste\\Celeste.exe\0";
+        let mut lnk = vec![0u8; 0x4c];
+        lnk[0] = 0x4c;
+        lnk[0x14] = 0x2 | 0x10 | 0x20 | 0x80; // HasLinkInfo, HasWorkingDir, HasArguments, IsUnicode
+        let info_size = 0x1c + target.len();
+        let mut info = vec![0u8; 0x1c];
+        info[0..4].copy_from_slice(&(info_size as u32).to_le_bytes());
+        info[4..8].copy_from_slice(&0x1cu32.to_le_bytes());
+        info[0x10..0x14].copy_from_slice(&0x1cu32.to_le_bytes());
+        lnk.extend(info);
+        lnk.extend(target);
+        for text in ["C:\\Games\\Celeste", "-windowed \"save 1\""] {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            lnk.extend((units.len() as u16).to_le_bytes());
+            lnk.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+        }
+        let link = super::parse_lnk(&lnk).unwrap();
+        assert_eq!(link.target, PathBuf::from("C:\\Games\\Celeste\\Celeste.exe"));
+        assert_eq!(link.args, "-windowed \"save 1\"");
+        assert_eq!(link.dir, Some(PathBuf::from("C:\\Games\\Celeste")));
+        assert_eq!(super::parse_lnk(b"not a shortcut"), None);
+    }
+
+    #[test]
+    fn reads_thegamesdb_image_urls() {
+        let reply = serde_json::json!({ "data": {
+            "base_url": { "thumb": "https://cdn.thegamesdb.net/images/thumb/", "original": "https://cdn.thegamesdb.net/images/original/" },
+            "images": { "140": [
+                { "type": "boxart", "side": "back", "filename": "boxart/back/140-1.jpg" },
+                { "type": "boxart", "side": "front", "filename": "boxart/front/140-1.jpg" },
+                { "type": "clearlogo", "filename": "clearlogo/140.png" }
+            ] }
+        } });
+        assert_eq!(
+            super::tgdb_image_urls(&reply, 140, "boxart"),
+            [("https://cdn.thegamesdb.net/images/thumb/boxart/front/140-1.jpg".to_owned(), "https://cdn.thegamesdb.net/images/original/boxart/front/140-1.jpg".to_owned())]
+        );
+        assert_eq!(super::tgdb_image_urls(&reply, 140, "clearlogo").len(), 1);
+        assert!(super::tgdb_image_urls(&reply, 140, "fanart").is_empty());
     }
 
     #[test]

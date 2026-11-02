@@ -98,6 +98,10 @@ struct Details {
     loading: bool,
     /// The Rename field is showing.
     renaming: bool,
+    /// The emulator popup is open, with this choice focused.
+    picking: Option<usize>,
+    /// Which art the choices are for; LB/RB switch it.
+    art: emu::Art,
     focus: usize,
     /// The cover choices scroll on their own, following the controller.
     scroll: ScrollHandle,
@@ -178,6 +182,8 @@ struct Hub {
     query: Entity<InputState>,
     /// The game page's Rename field.
     rename: Entity<InputState>,
+    /// The game page's cover search field.
+    cover_query: Entity<InputState>,
     /// Per-game settings from game pages, by scanned path.
     game_options: std::collections::HashMap<std::path::PathBuf, emu::GameOptions>,
     /// The Ctrl+K search popup is open, with this result picked; it types into `query`.
@@ -186,6 +192,7 @@ struct Hub {
     retroarch_cmd: Entity<InputState>,
     cores_dir: Entity<InputState>,
     steamgriddb_key: Entity<InputState>,
+    thegamesdb_key: Entity<InputState>,
     config: Config,
     systems: Vec<System>,
     games: Vec<Game>,
@@ -223,12 +230,16 @@ struct Hub {
     snaps_tried: std::collections::HashSet<std::path::PathBuf>,
     /// Each game's cover file if it has one, parallel to `games`, so drawing never touches the disk.
     covers: Vec<Option<std::path::PathBuf>>,
+    /// Each game's icon, if one is cached; shown in the side list instead of a tiny cover.
+    icons: Vec<Option<std::path::PathBuf>>,
     /// Each cover's color for the ambient background; None while it's being worked out or if it can't be.
     tints: std::collections::HashMap<std::path::PathBuf, Option<u32>>,
     /// Bumped on every rescan so an older cover download pass stops.
     cover_pass: usize,
     /// Bumped on every rescan so an older, slower scan doesn't replace a newer one.
     scan_pass: usize,
+    /// The first scan has finished; until then pages show placeholders.
+    scanned: bool,
     /// Horizontal scroll of the Home rows, so the controller's card stays in view.
     home_scroll: [ScrollHandle; 3],
     /// Vertical scroll of the Home page and the Settings popup's card, so the controller's item stays in view.
@@ -238,6 +249,8 @@ struct Hub {
     history: std::collections::HashMap<std::path::PathBuf, u64>,
     /// Seconds played per game.
     playtime: std::collections::HashMap<std::path::PathBuf, u64>,
+    /// Steam's own (play time, last played) for Steam games, by game path; merged into playtime and history.
+    steam_stats: std::collections::HashMap<std::path::PathBuf, (u64, u64)>,
     favorites: std::collections::HashSet<std::path::PathBuf>,
     message: String,
     /// The message shown as a toast and when it appeared, so it can fade away on its own.
@@ -385,6 +398,28 @@ impl Hub {
             }
         })
         .detach();
+        let cover_query = cx.new(|cx| InputState::new(window, cx).placeholder("Search covers by name"));
+        cx.subscribe_in(&cover_query, window, |view, input, event, _, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                let name = input.read(cx).value().trim().to_owned();
+                view.search_covers(name, cx);
+            }
+        })
+        .detach();
+        let thegamesdb_key = cx.new(|cx| InputState::new(window, cx).masked(true).default_value(config.thegamesdb_key.clone()));
+        // Saved as it's typed, like the SteamGridDB key.
+        cx.subscribe_in(&thegamesdb_key, window, |view, input, event, _, cx| {
+            if let InputEvent::Change = event {
+                view.config.thegamesdb_key = input.read(cx).value().trim().to_owned();
+                view.message = match view.config.save() {
+                    Ok(()) if view.config.thegamesdb_key.is_empty() => "TheGamesDB key removed.".into(),
+                    Ok(()) => "TheGamesDB key saved. Rescan to look for missing art.".into(),
+                    Err(error) => format!("Could not save TheGamesDB key: {error}"),
+                };
+                cx.notify();
+            }
+        })
+        .detach();
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search games"));
         cx.subscribe_in(&query, window, |view, _, event, _, cx| match event {
             InputEvent::PressEnter { .. } => {
@@ -450,12 +485,14 @@ impl Hub {
         let mut hub = Self {
             query,
             rename,
+            cover_query,
             game_options: emu::load_game_options(),
             search: None,
             roms_dir,
             retroarch_cmd,
             cores_dir,
             steamgriddb_key,
+            thegamesdb_key,
             systems: emu::systems(),
             games: vec![],
             config,
@@ -480,14 +517,17 @@ impl Hub {
             showing_game: false,
             snaps_tried: Default::default(),
             covers: vec![],
+            icons: vec![],
             tints: Default::default(),
             cover_pass: 0,
             scan_pass: 0,
+            scanned: false,
             home_scroll: [ScrollHandle::new(), ScrollHandle::new(), ScrollHandle::new()],
             home_page_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
             history: emu::load_history(),
             playtime: emu::load_playtime(),
+            steam_stats: Default::default(),
             favorites: emu::load_favorites(),
             message: String::new(),
             toast: (String::new(), std::time::Instant::now(), 0),
@@ -577,7 +617,7 @@ impl Hub {
         let pass = self.scan_pass;
         let (config, systems) = (self.config.clone(), self.systems.clone());
         cx.spawn(async move |this, cx| {
-            let (games, covers) = cx
+            let (games, covers, icons, steam) = cx
                 .background_executor()
                 .spawn(async move {
                     let mut games = emu::scan(&config.roms_dir, &systems);
@@ -585,11 +625,20 @@ impl Hub {
                     emu::apply_game_options(&mut games, &emu::load_game_options());
                     games.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                     let covers = games.iter().map(|g| Some(emu::cover_path(g)).filter(|p| p.exists())).collect();
-                    (games, covers)
+                    let icons = games.iter().map(|g| Some(emu::art_path(g, emu::Art::Icon)).filter(|p| p.exists())).collect();
+                    let stats = emu::steam_play_stats();
+                    let steam = games
+                        .iter()
+                        .filter_map(|g| Some((g.path.clone(), *stats.get(&emu::steam_appid(g)?)?)))
+                        .collect();
+                    (games, covers, icons, steam)
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.scan_pass == pass {
+                    view.steam_stats = steam;
+                    view.merge_steam_stats();
+                    view.icons = icons;
                     view.set_games(games, covers, cx);
                 }
             });
@@ -601,6 +650,7 @@ impl Hub {
         // Keep the selected game selected (and so its background) when it's still there.
         let selected = self.selected.map(|i| self.games[i].path.clone());
         let details = self.details.as_ref().map(|d| self.games[d.game].path.clone());
+        self.scanned = true;
         self.games = games;
         self.covers = covers;
         self.selected = selected.and_then(|path| self.games.iter().position(|g| g.path == path));
@@ -626,6 +676,7 @@ impl Hub {
     /// Downloads missing covers one by one in the background, redrawing as each arrives.
     fn refresh_covers(&mut self) {
         self.covers = self.games.iter().map(|g| Some(emu::cover_path(g)).filter(|p| p.exists())).collect();
+        self.icons = self.games.iter().map(|g| Some(emu::art_path(g, emu::Art::Icon)).filter(|p| p.exists())).collect();
     }
 
     fn fetch_covers(&mut self, cx: &mut Context<Self>) {
@@ -637,6 +688,7 @@ impl Hub {
         let recent: Vec<Game> = self.recent().into_iter().map(|i| self.games[i].clone()).collect();
         let cached: Vec<std::path::PathBuf> = self.covers.iter().flatten().cloned().collect();
         let key = self.config.steamgriddb_key.clone();
+        let tgdb = self.config.thegamesdb_key.clone();
         cx.spawn(async move |this, cx| {
             // 8 downloads at a time, redrawing once per batch.
             for batch in missing.chunks(8) {
@@ -644,8 +696,8 @@ impl Hub {
                     .iter()
                     .cloned()
                     .map(|(index, game)| {
-                        let key = key.clone();
-                        cx.background_executor().spawn(async move { (index, game.path.clone(), emu::fetch_cover(&game, &key).then(|| emu::cover_path(&game))) })
+                        let (key, tgdb) = (key.clone(), tgdb.clone());
+                        cx.background_executor().spawn(async move { (index, game.path.clone(), emu::fetch_cover(&game, &key, &tgdb).then(|| emu::cover_path(&game))) })
                     })
                     .collect();
                 let mut got = vec![];
@@ -695,8 +747,30 @@ impl Hub {
         if let Some(running) = self.running.take_if(|_| !open) {
             running.record_playtime();
             self.playtime = emu::load_playtime();
+            self.merge_steam_stats();
         }
         open
+    }
+
+    /// The game's logo when one is cached, else its name as large text.
+    fn title_or_logo(&self, game: &Game, text_size: f32, logo_height: f32) -> AnyElement {
+        let logo = emu::art_path(game, emu::Art::Logo);
+        if logo.exists() {
+            // Left-aligned like the text it replaces.
+            div().h(px(logo_height)).max_w(px(logo_height * 4.)).child(img(logo).h_full().object_fit(ObjectFit::Contain)).into_any_element()
+        } else {
+            div().text_size(px(text_size)).font_weight(FontWeight::SEMIBOLD).line_clamp(2).child(game.name.clone()).into_any_element()
+        }
+    }
+
+    /// Steam games show Steam's play time and last played, when Steam's are the newer numbers.
+    fn merge_steam_stats(&mut self) {
+        for (path, &(secs, last)) in &self.steam_stats {
+            let time = self.playtime.entry(path.clone()).or_default();
+            *time = (*time).max(secs);
+            let when = self.history.entry(path.clone()).or_default();
+            *when = (*when).max(last);
+        }
     }
 
     /// "Last played 2 days ago" and "3h 10m played", each on its own line so neither gets cut off.
@@ -724,8 +798,9 @@ impl Hub {
             }
             Err(error) => error,
         };
-        self.history = emu::load_history();
         let game = game.clone();
+        self.history = emu::load_history();
+        self.merge_steam_stats();
         cx.spawn(async move |this, cx| {
             if cx.background_executor().spawn(async move { emu::fetch_snap(&game) }).await {
                 let _ = this.update(cx, |_, cx| cx.notify());
@@ -927,7 +1002,7 @@ impl Hub {
 
     fn open_details(&mut self, game: usize, cx: &mut Context<Self>) {
         self.selected = Some(game);
-        self.details = Some(Details { game, candidates: None, loading: false, renaming: false, focus: 0, scroll: ScrollHandle::new() });
+        self.details = Some(Details { game, candidates: None, loading: false, renaming: false, picking: None, art: emu::Art::Cover, focus: 0, scroll: ScrollHandle::new() });
         cx.notify();
     }
 
@@ -936,6 +1011,19 @@ impl Hub {
         let Some(details) = &mut self.details else { return };
         let count = DETAIL_BUTTONS + details.candidates.as_ref().map_or(0, Vec::len);
         let focus = details.focus;
+        if let Some(pick) = details.picking {
+            let game = details.game;
+            let count = self.emulator_choices(&self.games[game]).len();
+            let Some(details) = &mut self.details else { return };
+            match action {
+                Pad::Up => details.picking = Some(pick.saturating_sub(1)),
+                Pad::Down => details.picking = Some((pick + 1).min(count.saturating_sub(1))),
+                Pad::Confirm => self.choose_emulator(pick, cx),
+                Pad::Back | Pad::Options => details.picking = None,
+                _ => {}
+            }
+            return;
+        }
         // Buttons are one row; covers follow in rows of CHOICE_COLUMNS.
         let next = match action {
             Pad::Back if details.renaming => {
@@ -947,10 +1035,17 @@ impl Hub {
                 return;
             }
             Pad::Confirm => return self.details_action(focus, window, cx),
+            Pad::PrevTab | Pad::NextTab if details.candidates.is_some() || details.loading => {
+                let at = emu::Art::ALL.iter().position(|&a| a == details.art).unwrap_or(0);
+                let next = if action == Pad::NextTab { (at + 1) % emu::Art::ALL.len() } else { (at + emu::Art::ALL.len() - 1) % emu::Art::ALL.len() };
+                return self.switch_art(emu::Art::ALL[next], cx);
+            }
             Pad::PrevTab | Pad::NextTab | Pad::CloseGame => return,
             Pad::Left => focus.saturating_sub(1),
             Pad::Right => (focus + 1).min(count - 1),
-            Pad::Up if focus < DETAIL_BUTTONS => focus,
+            // Back sits above the button row.
+            Pad::Up if focus < DETAIL_BUTTONS => DETAIL_BUTTONS - 1,
+            Pad::Down if focus == DETAIL_BUTTONS - 1 => 0,
             Pad::Up if focus < DETAIL_BUTTONS + CHOICE_COLUMNS => 2, // first row of covers → Change cover
             Pad::Up => focus - CHOICE_COLUMNS,
             Pad::Down if focus < DETAIL_BUTTONS => DETAIL_BUTTONS.min(count - 1),
@@ -992,6 +1087,121 @@ impl Hub {
         std::iter::once(system.default_emulator().to_owned()).chain(system.alts.iter().cloned()).filter(|c| !c.is_empty()).collect()
     }
 
+    /// Looks up cover choices for the game page's game under `name` (its own name, or one typed in the search field).
+    fn search_covers(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(details) = &mut self.details else { return };
+        if details.loading || name.is_empty() {
+            return;
+        }
+        details.loading = true;
+        details.candidates = None;
+        let mut game = self.games[details.game].clone();
+        game.name = name;
+        let (key, tgdb, kind) = (self.config.steamgriddb_key.clone(), self.config.thegamesdb_key.clone(), details.art);
+        cx.spawn(async move |this, cx| {
+            let found = cx.background_executor().spawn(async move { emu::art_candidates(&game, kind, &key, &tgdb) }).await;
+            let _ = this.update(cx, |view, cx| {
+                if let Some(details) = &mut view.details {
+                    details.loading = false;
+                    details.candidates = Some(found);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Shows the choices for another kind of art (cover, background, logo, icon), searching the same name.
+    fn switch_art(&mut self, kind: emu::Art, cx: &mut Context<Self>) {
+        let Some(details) = &mut self.details else { return };
+        if details.loading || details.art == kind {
+            return;
+        }
+        details.art = kind;
+        details.focus = 2;
+        let name = self.cover_query.read(cx).value().trim().to_owned();
+        self.search_covers(name, cx);
+    }
+
+    /// Asks for an image file and makes it the game page's game's art of the kind being chosen.
+    fn cover_from_file(&mut self, cx: &mut Context<Self>) {
+        let Some(details) = &self.details else { return };
+        let (game, kind) = (self.games[details.game].clone(), details.art);
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some(format!("Choose a {} image", kind.label().to_lowercase()).into()) });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut paths))) = picked.await {
+                let file = paths.remove(0);
+                let _ = this.update(cx, |view, cx| {
+                    view.run("Saving art…", move |_| emu::set_art_file(&game, kind, &file).map(|()| format!("{} updated.", kind.label())), cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Sets the game page's game to run with its n-th emulator choice, and closes the popup.
+    fn choose_emulator(&mut self, n: usize, cx: &mut Context<Self>) {
+        let Some(details) = &mut self.details else { return };
+        details.picking = None;
+        let game = self.games[details.game].clone();
+        let choices = self.emulator_choices(&game);
+        let Some(choice) = choices.get(n).cloned() else { return };
+        self.message = format!("{} now uses {}.", game.name, emu::emulator(&choice).map_or(choice.as_str(), |e| e.name));
+        // Back at the system's own choice, nothing needs saving.
+        let emulator = (n != 0).then_some(choice);
+        self.set_game_option(game.path, |o| o.emulator = emulator, cx);
+        cx.notify();
+    }
+
+    /// The emulator popup over the game page: one row per choice, the current one marked.
+    fn emulator_popup(&self, details: &Details, pick: usize, cx: &mut Context<Self>) -> Div {
+        let game = &self.games[details.game];
+        let current = self.game_options.get(&game.path).and_then(|o| o.emulator.clone());
+        let mut list = card();
+        for (n, choice) in self.emulator_choices(game).into_iter().enumerate() {
+            let (name, installed) = match emu::emulator(&choice) {
+                Some(e) => (e.name.to_owned(), emu::find_emulator(&self.config, e).is_some()),
+                None => (choice.clone(), emu::core_installed(&self.config, &choice)),
+            };
+            let mut note = vec![if n == 0 { "System default" } else { "Alternate" }];
+            note.push(if installed { "installed" } else { "not installed: Settings → Cores or Emulators" });
+            let chosen = current.as_deref().map_or(n == 0, |c| c == choice);
+            list = list.child(
+                self.ring(setting_row(&name, &note.join(", ")).rounded_md(), pick == n)
+                    .id(("emulator-choice", n))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(0xffffff0a)))
+                    .on_click(cx.listener(move |view, _, _, cx| view.choose_emulator(n, cx)))
+                    .child(if chosen { icon("play", 16., rgb(self.appearance.accent)) } else { icon("none", 16., rgb(MUTED)) }),
+            );
+        }
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .occlude()
+            .child(
+                div()
+                    .w(px(520.))
+                    .p_6()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .rounded_lg()
+                    .bg(self.appearance.fill(0x101e23))
+                    .border_1()
+                    .border_color(rgba(0xffffff14))
+                    .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child(format!("Run {} with", game.name)))
+                    .child(list),
+            )
+    }
+
     /// What a game runs with, as shown on its page.
     fn emulator_label(&self, game: &Game) -> String {
         let choice = self.game_options.get(&game.path).and_then(|o| o.emulator.clone());
@@ -1016,20 +1226,9 @@ impl Hub {
                 self.toggle_favorite(index);
             }
             2 if !details.loading => {
-                details.loading = true;
-                details.candidates = None;
-                let key = self.config.steamgriddb_key.clone();
-                cx.spawn(async move |this, cx| {
-                    let found = cx.background_executor().spawn(async move { emu::cover_candidates(&game, &key) }).await;
-                    let _ = this.update(cx, |view, cx| {
-                        if let Some(details) = &mut view.details {
-                            details.loading = false;
-                            details.candidates = Some(found);
-                        }
-                        cx.notify();
-                    });
-                })
-                .detach();
+                let name = game.name.clone();
+                self.cover_query.update(cx, |input, cx| input.set_value(name.clone(), window, cx));
+                self.search_covers(name, cx);
             }
             2 => {}
             3 if details.renaming => self.save_rename(window, cx),
@@ -1045,12 +1244,10 @@ impl Hub {
                 let choices = self.emulator_choices(&game);
                 if choices.len() > 1 {
                     let current = self.game_options.get(&game.path).and_then(|o| o.emulator.clone()).unwrap_or_else(|| choices[0].clone());
-                    let next = choices[(choices.iter().position(|c| *c == current).unwrap_or(0) + 1) % choices.len()].clone();
-                    let label = emu::emulator(&next).map_or(next.clone(), |e| e.name.to_owned());
-                    self.message = format!("{} now uses {label}.", game.name);
-                    // Back at the system's own choice, nothing needs saving.
-                    let emulator = (next != choices[0]).then_some(next);
-                    self.set_game_option(game.path.clone(), |o| o.emulator = emulator, cx);
+                    let pick = choices.iter().position(|c| *c == current).unwrap_or(0);
+                    if let Some(details) = &mut self.details {
+                        details.picking = Some(pick);
+                    }
                 }
             }
             5 if pc_program => {
@@ -1080,8 +1277,8 @@ impl Hub {
             7 => self.details = None,
             n => {
                 let Some(choice) = details.candidates.as_ref().and_then(|c| c.get(n - DETAIL_BUTTONS)) else { return };
-                let url = choice.url.clone();
-                self.run("Downloading cover…", move |_| emu::set_cover(&game, &url).map(|()| "Cover updated.".into()), cx);
+                let (url, kind) = (choice.url.clone(), details.art);
+                self.run("Downloading art…", move |_| emu::set_art(&game, kind, &url).map(|()| format!("{} updated.", kind.label())), cx);
             }
         }
         cx.notify();
@@ -1106,12 +1303,11 @@ impl Hub {
         for (i, (id, name, label)) in [
             ("detail-play", "play", "Play"),
             ("detail-favorite", heart, heart_label),
-            ("detail-cover", "image", "Change cover"),
+            ("detail-cover", "image", "Change art"),
             ("detail-rename", "edit", if details.renaming { "Save name" } else { "Rename" }),
             ("detail-emulator", "gamepad", emulator.as_str()),
             ("detail-program", "folder", "Program"),
             ("detail-hide", "eye-off", "Hide"),
-            ("detail-close", "arrow-left", "Back"),
         ]
         .into_iter()
         .enumerate()
@@ -1157,11 +1353,28 @@ impl Hub {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .h(px(360.))
                             .flex()
                             .flex_col()
                             .gap_2()
+                            // Back in the top corner, level with the cover's top edge.
+                            .child(
+                                div()
+                                    .id("detail-close")
+                                    .flex_1()
+                                    .child(
+                                        self.ring(
+                                            div().w(px(44.)).h(px(44.)).rounded_full().flex().items_center().justify_center().cursor_pointer().bg(rgba(0xffffff1a)),
+                                            focused(DETAIL_BUTTONS - 1),
+                                        )
+                                        .id("detail-back")
+                                        .hover(|style| style.opacity(0.85))
+                                        .on_click(cx.listener(|view, _, window, cx| view.details_action(DETAIL_BUTTONS - 1, window, cx)))
+                                        .child(icon("arrow-left", 20., rgb(TEXT))),
+                                    ),
+                            )
                             .child(heading(system_name(&self.systems, &game.system)))
-                            .child(div().text_size(px(40.)).font_weight(FontWeight::SEMIBOLD).child(game.name.clone()))
+                            .child(self.title_or_logo(game, 40., 100.))
                             .child(self.played_rows(&game.path))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(game.path.display().to_string()))
                             .child(buttons),
@@ -1178,6 +1391,32 @@ impl Hub {
             );
         }
 
+        if details.loading || details.candidates.is_some() {
+            // Another name to search for, or an image of your own.
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().w(px(420.)).child(Input::new(&self.cover_query)))
+                    .child(Button::new("cover-search").label("Search").disabled(details.loading).on_click(cx.listener(|view, _, _, cx| {
+                        let name = view.cover_query.read(cx).value().trim().to_owned();
+                        view.search_covers(name, cx);
+                    })))
+                    .child(Button::new("cover-file").label("From file…").on_click(cx.listener(|view, _, _, cx| view.cover_from_file(cx)))),
+            );
+            // Which art to choose; LB/RB on a controller.
+            let mut tabs = div().flex().gap_2();
+            for kind in emu::Art::ALL {
+                tabs = tabs.child(
+                    Button::new(SharedString::from(format!("art-{}", kind.label())))
+                        .label(kind.label())
+                        .selected(details.art == kind)
+                        .on_click(cx.listener(move |view, _, _, cx| view.switch_art(kind, cx))),
+                );
+            }
+            panel = panel.child(tabs);
+        }
         if details.loading {
             panel = panel.child(div().text_color(rgb(MUTED)).child("Finding covers…"));
         } else if let Some(candidates) = &details.candidates {
@@ -1203,20 +1442,23 @@ impl Hub {
                         .on_click(cx.listener(move |view, _, window, cx| view.details_action(item, window, cx)))
                         .child(
                             self.ring(div().w(px(110.)).h(px(165.)).rounded_md().overflow_hidden(), focused(item))
-                                .child(img(choice.preview.clone()).size_full().object_fit(ObjectFit::Cover)),
+                                // Covers fill the box; wide backgrounds, logos and icons are shown whole on a dark backing.
+                                .when(details.art != emu::Art::Cover, |d| d.bg(rgba(0x00000060)).p_1())
+                                .child(img(choice.preview.clone()).size_full().object_fit(if details.art == emu::Art::Cover { ObjectFit::Cover } else { ObjectFit::Contain })),
                         )
                         .child(div().text_xs().text_color(rgb(MUTED)).line_clamp(2).child(choice.label.clone())),
                 );
             }
-            panel = panel.child(heading("Choose a cover")).child(if candidates.is_empty() {
-                div().text_color(rgb(MUTED)).child("No other covers found. Add a SteamGridDB key in Settings for more choices.").into_any_element()
+            panel = panel.child(heading(&format!("Choose a {}", details.art.label().to_lowercase()))).child(if candidates.is_empty() {
+                div().text_color(rgb(MUTED)).child("Nothing found. Try another name, or add SteamGridDB and TheGamesDB keys in Settings → Paths.").into_any_element()
             } else {
                 choices.into_any_element()
             });
         }
 
-        // Full page between the title bar and the hints bar, over a dimmed copy of the cover.
-        let cover = emu::cover_path(game);
+        // Full page between the title bar and the hints bar, over a dimmed background (or the cover).
+        let hero = emu::art_path(game, emu::Art::Hero);
+        let (cover, opacity) = if hero.exists() { (hero, 0.3) } else { (emu::cover_path(game), 0.12) };
         div()
             .id("details")
             .relative()
@@ -1225,9 +1467,10 @@ impl Hub {
             .overflow_hidden()
             .bg(self.appearance.fill(0x101e23))
             .when(self.appearance.backdrop == appearance::Backdrop::Cover && cover.exists(), |d| {
-                d.child(div().absolute().top_0().left_0().size_full().opacity(0.12).child(img(cover).size_full().object_fit(ObjectFit::Cover)))
+                d.child(div().absolute().top_0().left_0().size_full().opacity(opacity).child(img(cover).size_full().object_fit(ObjectFit::Cover)))
             })
             .child(panel)
+            .when_some(details.picking, |d, pick| d.child(self.emulator_popup(details, pick, cx)))
     }
 
     /// Position of the selected game within the visible list.
@@ -1568,6 +1811,9 @@ impl Hub {
         self.config.retroarch_cmd = read(&self.retroarch_cmd).split_whitespace().map(String::from).collect();
         self.config.cores_dir = read(&self.cores_dir).into();
         self.config.steamgriddb_key = read(&self.steamgriddb_key);
+        self.config.thegamesdb_key = read(&self.thegamesdb_key);
+        // A new key may find art that was missing before.
+        cx.background_executor().spawn(async { emu::forget_art_misses() }).detach();
         self.message = match self.config.save() {
             Ok(()) => "Settings saved.".into(),
             Err(error) => error,
@@ -1776,10 +2022,29 @@ impl Hub {
         if !self.snaps_tried.insert(game.path.clone()) {
             return;
         }
+        let (key, tgdb) = (self.config.steamgriddb_key.clone(), self.config.thegamesdb_key.clone());
         cx.spawn(async move |this, cx| {
-            if cx.background_executor().spawn(async move { emu::fetch_snap(&game) }).await {
-                let _ = this.update(cx, |_, cx| cx.notify());
-            }
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    let snap = emu::fetch_snap(&game);
+                    // Heroes, logos and icons for the game being looked at, one game at a time.
+                    let art = [emu::Art::Hero, emu::Art::Logo, emu::Art::Icon].map(|kind| emu::fetch_art(&game, kind, &key, &tgdb));
+                    let icon = art[2].then(|| emu::art_path(&game, emu::Art::Icon));
+                    (snap || art.contains(&true), game.path, icon)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                let (any, path, icon) = found;
+                if let Some(i) = view.games.iter().position(|g| g.path == path) {
+                    if let Some(slot) = view.icons.get_mut(i) {
+                        *slot = icon;
+                    }
+                }
+                if any {
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }
@@ -1791,8 +2056,14 @@ impl Hub {
             return pane.items_center().justify_center().text_color(rgb(MUTED)).child("Select a game to see it here.");
         };
         let game = &self.games[index];
-        let snap = emu::snap_path(game);
-        let art = if snap.exists() { Some(snap) } else { self.covers[index].clone() };
+        let (hero, snap) = (emu::art_path(game, emu::Art::Hero), emu::snap_path(game));
+        let art = if hero.exists() {
+            Some(hero)
+        } else if snap.exists() {
+            Some(snap)
+        } else {
+            self.covers[index].clone()
+        };
         let page = self.appearance.fill(0x0c1417);
         let fade = linear_gradient(180., linear_color_stop(Rgba { a: 0., ..page }, 0.3), linear_color_stop(page, 1.));
         pane.child(
@@ -1819,7 +2090,7 @@ impl Hub {
                 .gap_4()
                 // Pulled up over the art's fade, like Playnite's title.
                 .mt(px(-56.))
-                .child(div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).line_clamp(2).child(game.name.clone()))
+                .child(self.title_or_logo(game, 30., 80.))
                 .child(self.game_actions(index, cx))
                 .child(self.game_facts(index).max_w(px(520.))),
         )
@@ -1881,6 +2152,7 @@ impl Hub {
             .child(setting_row("RetroArch command", "Program and arguments, separated by spaces.").child(div().w(px(360.)).child(Input::new(&self.retroarch_cmd))))
             .child(setting_row("Cores folder", "Where RetroArch keeps its cores.").child(div().w(px(360.)).child(Input::new(&self.cores_dir))))
             .child(setting_row("SteamGridDB API key", "Optional. Fills in covers libretro doesn't have. steamgriddb.com → Preferences → API.").child(div().w(px(360.)).child(Input::new(&self.steamgriddb_key).mask_toggle())))
+            .child(setting_row("TheGamesDB API key", "Optional. Box art, backgrounds and logos for retro games. Request one on forums.thegamesdb.net.").child(div().w(px(360.)).child(Input::new(&self.thegamesdb_key).mask_toggle())))
             .child(setting_row("Save changes", "").child(
                 Button::new("save").primary().label("Save").on_click(cx.listener(|view, _, _, cx| view.save_settings(cx))),
             ));
@@ -2487,7 +2759,10 @@ impl Hub {
             })
             .bg(if selected { rgba((accent << 8) | 0x20) } else { rgba(0x00000000) })
             .hover(|style| style.bg(rgba(0xffffff0a)))
-            .child(div().w(px(18.)).h(px(24.)).flex_none().rounded_sm().overflow_hidden().child(self.cover(index, 18.)))
+            .child(match self.icons.get(index).cloned().flatten() {
+                Some(icon) => div().w(px(18.)).h(px(24.)).flex_none().flex().items_center().child(img(icon).size(px(18.)).object_fit(ObjectFit::Contain)),
+                None => div().w(px(18.)).h(px(24.)).flex_none().rounded_sm().overflow_hidden().child(self.cover(index, 18.)),
+            })
             .child(div().flex_1().min_w_0().truncate().child(game.name.clone()))
             .children(self.favorites.contains(&game.path).then(|| icon("heart-filled", 14., rgb(accent))))
             .on_mouse_down(
@@ -2536,6 +2811,24 @@ impl Hub {
         cards
     }
 
+    /// Gray stand-ins for the hero and two rows of covers, gently pulsing, while the first scan runs.
+    fn skeleton_page(&self) -> Stateful<Div> {
+        let block = |w: f32, h: f32| div().w(px(w)).h(px(h)).flex_none().rounded(self.cover_corners()).bg(rgba(0xffffff0f));
+        let row = |n: usize| div().flex().gap_4().px_6().pb_6().children((0..n).map(|_| block(150., 225.)));
+        let content = div()
+            .flex()
+            .flex_col()
+            .child(div().p_6().flex().flex_col().gap_3().child(block(420., 40.)).child(block(260., 18.)).child(block(180., 18.)))
+            .child(div().px_6().pt_5().pb_2().child(block(180., 18.)))
+            .child(row(8))
+            .child(div().px_6().pt_5().pb_2().child(block(140., 18.)))
+            .child(row(8))
+            .with_animation("skeleton", Animation::new(std::time::Duration::from_millis(1200)).repeat().with_easing(pulsating_between(0.4, 1.)), |d, t| {
+                d.opacity(t)
+            });
+        div().id("skeleton").size_full().overflow_hidden().bg(self.appearance.fill(0x0c1417)).child(content)
+    }
+
     fn home_page(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let recent = self.recent();
         let favorites = self.favorite_games();
@@ -2549,6 +2842,9 @@ impl Hub {
 
         // Hero: in-game screenshot on the left, title and facts on the right, like the old EmuHub's showcase.
         let hero_art = match hero {
+            Some(game) if emu::art_path(game, emu::Art::Hero).exists() => {
+                img(emu::art_path(game, emu::Art::Hero)).size_full().object_fit(ObjectFit::Cover).into_any_element()
+            }
             Some(game) if emu::snap_path(game).exists() => {
                 img(emu::snap_path(game)).size_full().object_fit(ObjectFit::Cover).into_any_element()
             }
@@ -2613,7 +2909,10 @@ impl Hub {
                     .items_center()
                     .justify_center()
                     .gap_4()
-                    .child(div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).text_center().line_clamp(2).child(title))
+                    .child(match hero.map(|g| emu::art_path(g, emu::Art::Logo)).filter(|p| p.exists()) {
+                        Some(logo) => img(logo).w(px(320.)).h(px(90.)).object_fit(ObjectFit::Contain).into_any_element(),
+                        None => div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).text_center().line_clamp(2).child(title).into_any_element(),
+                    })
                     .child(facts),
             );
 
@@ -2809,6 +3108,7 @@ impl Render for Hub {
             self.fetch_selected_snap(cx);
         }
         let page = match self.view {
+            _ if !self.scanned => self.skeleton_page(),
             View::Home if self.selected.is_some() => div().id("home-split").size_full().flex().child(self.home_page(cx).flex_1().min_w_0()).child(self.game_panel(cx)),
             View::Home => self.home_page(cx),
             View::Library => self.library_page(&visible, cx),
