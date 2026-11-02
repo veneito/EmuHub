@@ -69,6 +69,14 @@ enum Setting {
     CoreList,
     /// Install or reinstall CORES[i].
     Core(usize),
+    /// Show or hide installed Steam games in PC Games.
+    SteamGames,
+    /// Add a folder to scan for PC games.
+    AddPcFolder,
+    /// Forget the added PC game folders.
+    ClearPcFolders,
+    /// Show every game hidden from its game page again.
+    UnhideGames,
     Palette(usize),
     SquareCovers(bool),
     Backdrop(appearance::Backdrop),
@@ -88,12 +96,15 @@ struct Details {
     /// None until "Change cover" is pressed; then the downloaded choices.
     candidates: Option<Vec<emu::Candidate>>,
     loading: bool,
+    /// The Rename field is showing.
+    renaming: bool,
     focus: usize,
     /// The cover choices scroll on their own, following the controller.
     scroll: ScrollHandle,
 }
 
-const DETAIL_BUTTONS: usize = 4;
+/// Play, Favorite, Change cover, Rename, Emulator, Program, Hide, Back.
+const DETAIL_BUTTONS: usize = 8;
 /// Width of Home's side panel.
 const PANEL_WIDTH: f32 = 300.;
 /// Cover choices per row: the 740px choices box fits six 110px tiles with 16px gaps.
@@ -118,8 +129,8 @@ enum LibRow {
 /// The Settings popup's categories; Paths needs a keyboard, so it has no controller buttons.
 const SETTING_CATEGORIES: [&str; 5] = ["Setup", "Cores", "Emulators", "Appearance", "Paths"];
 
-/// emu::needed_cores(), parsed once: settings_items() runs for every Settings button drawn.
-static CORES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(emu::needed_cores);
+/// emu::all_cores(), parsed once: settings_items() runs for every Settings button drawn.
+static CORES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(emu::all_cores);
 
 /// (category, row in that category's card) of a Settings button.
 fn setting_place(setting: Setting) -> (usize, usize) {
@@ -128,6 +139,10 @@ fn setting_place(setting: Setting) -> (usize, usize) {
         Setting::RomFolders => (0, 1),
         Setting::RetroArch => (0, 2),
         Setting::CoreList | Setting::Cores => (0, 3),
+        // Row 4 is BIOS files, which has no button.
+        Setting::SteamGames => (0, 5),
+        Setting::AddPcFolder | Setting::ClearPcFolders => (0, 6),
+        Setting::UnhideGames => (0, 7),
         Setting::Core(i) => (1, i),
         Setting::EmulatorFolder(i) | Setting::PickEmulator(i) | Setting::EmulatorSite(i) => (2, i),
         Setting::Palette(_) => (3, 0),
@@ -139,7 +154,7 @@ fn setting_place(setting: Setting) -> (usize, usize) {
 
 /// The Settings buttons a controller can reach, in on-screen order: Setup, Cores, Emulators, Appearance.
 fn settings_items() -> Vec<Setting> {
-    let mut items = vec![Setting::EmulationFolder, Setting::RomFolders, Setting::RetroArch, Setting::CoreList, Setting::Cores];
+    let mut items = vec![Setting::EmulationFolder, Setting::RomFolders, Setting::RetroArch, Setting::CoreList, Setting::Cores, Setting::SteamGames, Setting::AddPcFolder, Setting::ClearPcFolders, Setting::UnhideGames];
     items.extend((0..CORES.len()).map(Setting::Core));
     for i in 0..emu::EMULATORS.len() {
         items.extend([Setting::EmulatorFolder(i), Setting::PickEmulator(i), Setting::EmulatorSite(i)]);
@@ -161,6 +176,10 @@ enum UpdateState {
 
 struct Hub {
     query: Entity<InputState>,
+    /// The game page's Rename field.
+    rename: Entity<InputState>,
+    /// Per-game settings from game pages, by scanned path.
+    game_options: std::collections::HashMap<std::path::PathBuf, emu::GameOptions>,
     /// The Ctrl+K search popup is open, with this result picked; it types into `query`.
     search: Option<usize>,
     roms_dir: Entity<InputState>,
@@ -208,6 +227,8 @@ struct Hub {
     tints: std::collections::HashMap<std::path::PathBuf, Option<u32>>,
     /// Bumped on every rescan so an older cover download pass stops.
     cover_pass: usize,
+    /// Bumped on every rescan so an older, slower scan doesn't replace a newer one.
+    scan_pass: usize,
     /// Horizontal scroll of the Home rows, so the controller's card stays in view.
     home_scroll: [ScrollHandle; 3],
     /// Vertical scroll of the Home page and the Settings popup's card, so the controller's item stays in view.
@@ -357,6 +378,13 @@ impl Hub {
             }
         })
         .detach();
+        let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Leave empty for the file's name"));
+        cx.subscribe_in(&rename, window, |view, _, event, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                view.save_rename(window, cx);
+            }
+        })
+        .detach();
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search games"));
         cx.subscribe_in(&query, window, |view, _, event, _, cx| match event {
             InputEvent::PressEnter { .. } => {
@@ -421,6 +449,8 @@ impl Hub {
 
         let mut hub = Self {
             query,
+            rename,
+            game_options: emu::load_game_options(),
             search: None,
             roms_dir,
             retroarch_cmd,
@@ -452,6 +482,7 @@ impl Hub {
             covers: vec![],
             tints: Default::default(),
             cover_pass: 0,
+            scan_pass: 0,
             home_scroll: [ScrollHandle::new(), ScrollHandle::new(), ScrollHandle::new()],
             home_page_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
@@ -540,14 +571,48 @@ impl Hub {
         self.focus = Focus::Grid;
     }
 
+    /// Scans on a background thread: big PC game folders can take seconds to walk.
     fn rescan(&mut self, cx: &mut Context<Self>) {
+        self.scan_pass += 1;
+        let pass = self.scan_pass;
+        let (config, systems) = (self.config.clone(), self.systems.clone());
+        cx.spawn(async move |this, cx| {
+            let (games, covers) = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut games = emu::scan(&config.roms_dir, &systems);
+                    games.extend(emu::pc_games(&config));
+                    emu::apply_game_options(&mut games, &emu::load_game_options());
+                    games.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    let covers = games.iter().map(|g| Some(emu::cover_path(g)).filter(|p| p.exists())).collect();
+                    (games, covers)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.scan_pass == pass {
+                    view.set_games(games, covers, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_games(&mut self, games: Vec<Game>, covers: Vec<Option<std::path::PathBuf>>, cx: &mut Context<Self>) {
         // Keep the selected game selected (and so its background) when it's still there.
         let selected = self.selected.map(|i| self.games[i].path.clone());
-        self.games = emu::scan(&self.config.roms_dir, &self.systems);
-        self.games.extend(emu::steam_games());
-        self.games.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        self.refresh_covers();
+        let details = self.details.as_ref().map(|d| self.games[d.game].path.clone());
+        self.games = games;
+        self.covers = covers;
         self.selected = selected.and_then(|path| self.games.iter().position(|g| g.path == path));
+        // The game page follows its game to its new place, and closes if the game was hidden.
+        match details.and_then(|path| self.games.iter().position(|g| g.path == path)) {
+            Some(i) => {
+                if let Some(d) = &mut self.details {
+                    d.game = i;
+                }
+            }
+            None => self.details = None,
+        }
         if self.system.as_deref().is_some_and(|s| s != FAVORITES && !self.games.iter().any(|g| g.system == s)) {
             self.system = None;
         }
@@ -730,7 +795,7 @@ impl Hub {
         }
         self.pad_used = true;
         if self.details.is_some() {
-            self.details_pad(action, cx);
+            self.details_pad(action, window, cx);
             cx.notify();
             return;
         }
@@ -862,22 +927,26 @@ impl Hub {
 
     fn open_details(&mut self, game: usize, cx: &mut Context<Self>) {
         self.selected = Some(game);
-        self.details = Some(Details { game, candidates: None, loading: false, focus: 0, scroll: ScrollHandle::new() });
+        self.details = Some(Details { game, candidates: None, loading: false, renaming: false, focus: 0, scroll: ScrollHandle::new() });
         cx.notify();
     }
 
     /// Controller on the game page: any direction steps through the buttons and cover choices.
-    fn details_pad(&mut self, action: Pad, cx: &mut Context<Self>) {
+    fn details_pad(&mut self, action: Pad, window: &mut Window, cx: &mut Context<Self>) {
         let Some(details) = &mut self.details else { return };
         let count = DETAIL_BUTTONS + details.candidates.as_ref().map_or(0, Vec::len);
         let focus = details.focus;
-        // Buttons are 0..4 in one row; covers follow in rows of CHOICE_COLUMNS.
+        // Buttons are one row; covers follow in rows of CHOICE_COLUMNS.
         let next = match action {
+            Pad::Back if details.renaming => {
+                details.renaming = false;
+                return;
+            }
             Pad::Back | Pad::Options => {
                 self.details = None;
                 return;
             }
-            Pad::Confirm => return self.details_action(focus, cx),
+            Pad::Confirm => return self.details_action(focus, window, cx),
             Pad::PrevTab | Pad::NextTab | Pad::CloseGame => return,
             Pad::Left => focus.saturating_sub(1),
             Pad::Right => (focus + 1).min(count - 1),
@@ -893,10 +962,49 @@ impl Hub {
         }
     }
 
-    /// 0 = Play, 1 = Favorite, 2 = Change cover, 3 = Back, 4.. = pick that cover.
-    fn details_action(&mut self, item: usize, cx: &mut Context<Self>) {
+    /// Changes one game's settings, saves them, and rescans when the library shows the change.
+    fn set_game_option(&mut self, path: std::path::PathBuf, change: impl FnOnce(&mut emu::GameOptions), cx: &mut Context<Self>) {
+        let options = self.game_options.entry(path).or_default();
+        let before = (options.name.clone(), options.hidden);
+        change(options);
+        let rescan = before != (options.name.clone(), options.hidden);
+        if let Err(error) = emu::save_game_options(&self.game_options) {
+            self.message = format!("Could not save game settings: {error}");
+        }
+        if rescan {
+            self.rescan(cx);
+        }
+    }
+
+    fn save_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(details) = &mut self.details else { return };
+        details.renaming = false;
+        let path = self.games[details.game].path.clone();
+        let name = self.rename.read(cx).value().trim().to_owned();
+        self.set_game_option(path, |o| o.name = (!name.is_empty()).then_some(name), cx);
+        window.blur();
+        cx.notify();
+    }
+
+    /// The cores and emulators a game can use: its system's own first, then the alternates.
+    fn emulator_choices(&self, game: &Game) -> Vec<String> {
+        let Some(system) = self.systems.iter().find(|s| s.id == game.system) else { return Vec::new() };
+        std::iter::once(system.default_emulator().to_owned()).chain(system.alts.iter().cloned()).filter(|c| !c.is_empty()).collect()
+    }
+
+    /// What a game runs with, as shown on its page.
+    fn emulator_label(&self, game: &Game) -> String {
+        let choice = self.game_options.get(&game.path).and_then(|o| o.emulator.clone());
+        let id = choice.or_else(|| self.emulator_choices(game).into_iter().next()).unwrap_or_default();
+        emu::emulator(&id).map_or(id.clone(), |e| e.name.to_owned())
+    }
+
+    /// 0 = Play, 1 = Favorite, 2 = Change cover, 3 = Rename, 4 = Emulator, 5 = Program, 6 = Hide, 7 = Back,
+    /// 8.. = pick that cover.
+    fn details_action(&mut self, item: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(details) = &mut self.details else { return };
         let game = self.games[details.game].clone();
+        let pc_program = game.system == emu::PC && game.path.extension().is_none_or(|e| e != "acf");
         match item {
             0 => {
                 let index = details.game;
@@ -924,7 +1032,52 @@ impl Hub {
                 .detach();
             }
             2 => {}
-            3 => self.details = None,
+            3 if details.renaming => self.save_rename(window, cx),
+            3 => {
+                details.renaming = true;
+                let name = game.name.clone();
+                self.rename.update(cx, |input, cx| {
+                    input.set_value(name, window, cx);
+                    input.focus(window, cx);
+                });
+            }
+            4 => {
+                let choices = self.emulator_choices(&game);
+                if choices.len() > 1 {
+                    let current = self.game_options.get(&game.path).and_then(|o| o.emulator.clone()).unwrap_or_else(|| choices[0].clone());
+                    let next = choices[(choices.iter().position(|c| *c == current).unwrap_or(0) + 1) % choices.len()].clone();
+                    let label = emu::emulator(&next).map_or(next.clone(), |e| e.name.to_owned());
+                    self.message = format!("{} now uses {label}.", game.name);
+                    // Back at the system's own choice, nothing needs saving.
+                    let emulator = (next != choices[0]).then_some(next);
+                    self.set_game_option(game.path.clone(), |o| o.emulator = emulator, cx);
+                }
+            }
+            5 if pc_program => {
+                let picked = cx.prompt_for_paths(PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: false,
+                    prompt: Some(format!("Choose the program for {}", game.name).into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Ok(Some(mut paths))) = picked.await {
+                        let _ = this.update(cx, |view, cx| {
+                            let program = paths.remove(0);
+                            view.message = format!("{} now starts {}.", game.name, program.display());
+                            view.set_game_option(game.path.clone(), |o| o.program = Some(program), cx);
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }
+            5 => {}
+            6 => {
+                self.message = format!("{} hidden. Settings → Setup → Hidden games brings it back.", game.name);
+                self.set_game_option(game.path.clone(), |o| o.hidden = true, cx);
+            }
+            7 => self.details = None,
             n => {
                 let Some(choice) = details.candidates.as_ref().and_then(|c| c.get(n - DETAIL_BUTTONS)) else { return };
                 let url = choice.url.clone();
@@ -947,15 +1100,24 @@ impl Hub {
         let mut buttons = div().flex().gap_6().pt_4();
         let favorite = self.favorites.contains(&game.path);
         let (heart, heart_label) = if favorite { ("heart-filled", "Unfavorite") } else { ("heart", "Favorite") };
+        let emulator = self.emulator_label(game);
+        let pc_program = game.system == emu::PC && game.path.extension().is_none_or(|e| e != "acf");
+        let has_choices = self.emulator_choices(game).len() > 1;
         for (i, (id, name, label)) in [
             ("detail-play", "play", "Play"),
             ("detail-favorite", heart, heart_label),
             ("detail-cover", "image", "Change cover"),
+            ("detail-rename", "edit", if details.renaming { "Save name" } else { "Rename" }),
+            ("detail-emulator", "gamepad", emulator.as_str()),
+            ("detail-program", "folder", "Program"),
+            ("detail-hide", "eye-off", "Hide"),
             ("detail-close", "arrow-left", "Back"),
         ]
         .into_iter()
         .enumerate()
         {
+            // Emulator only for games with a choice, Program only for PC programs.
+            let unavailable = (i == 4 && !has_choices) || (i == 5 && !pc_program);
             let (bg, fg) = if i == 0 { (rgb(self.appearance.accent), rgb(0x0c1417)) } else { (rgba(0xffffff1a), rgb(TEXT)) };
             let circle = self
                 .ring(div().w(px(64.)).h(px(64.)).rounded_full().flex().items_center().justify_center().bg(bg), focused(i))
@@ -968,11 +1130,11 @@ impl Hub {
                     .items_center()
                     .gap_2()
                     .cursor_pointer()
-                    .when(i == 2 && details.loading, |d| d.opacity(0.5))
+                    .when((i == 2 && details.loading) || unavailable, |d| d.opacity(0.4))
                     .hover(|style| style.opacity(0.85))
-                    .on_click(cx.listener(move |view, _, _, cx| view.details_action(i, cx)))
+                    .on_click(cx.listener(move |view, _, window, cx| view.details_action(i, window, cx)))
                     .child(circle)
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(label)),
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(label.to_owned())),
             );
         }
 
@@ -1005,6 +1167,16 @@ impl Hub {
                             .child(buttons),
                     ),
             );
+        if details.renaming {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().w(px(420.)).child(Input::new(&self.rename)))
+                    .child(Button::new("rename-save").primary().label("Save").on_click(cx.listener(|view, _, window, cx| view.save_rename(window, cx)))),
+            );
+        }
 
         if details.loading {
             panel = panel.child(div().text_color(rgb(MUTED)).child("Finding covers…"));
@@ -1028,7 +1200,7 @@ impl Hub {
                         .flex_col()
                         .gap_1()
                         .cursor_pointer()
-                        .on_click(cx.listener(move |view, _, _, cx| view.details_action(item, cx)))
+                        .on_click(cx.listener(move |view, _, window, cx| view.details_action(item, window, cx)))
                         .child(
                             self.ring(div().w(px(110.)).h(px(165.)).rounded_md().overflow_hidden(), focused(item))
                                 .child(img(choice.preview.clone()).size_full().object_fit(ObjectFit::Cover)),
@@ -1136,6 +1308,45 @@ impl Hub {
                 if emu::core_status(&self.config).0 > 0 {
                     self.run("Downloading cores…", |config| emu::install_cores(&config).map(|n| format!("Installed {n} new cores.")), cx)
                 }
+            }
+            Setting::SteamGames => {
+                self.config.hide_steam = !self.config.hide_steam;
+                self.message = self.config.save().err().unwrap_or_default();
+                self.rescan(cx);
+            }
+            Setting::AddPcFolder => {
+                let picked = cx.prompt_for_paths(PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: Some("Choose a folder of PC games".into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Ok(Some(mut paths))) = picked.await {
+                        let _ = this.update(cx, |view, cx| {
+                            let folder = paths.remove(0);
+                            if !view.config.pc_folders.contains(&folder) {
+                                view.config.pc_folders.push(folder);
+                            }
+                            view.message = view.config.save().err().unwrap_or_default();
+                            view.rescan(cx);
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }
+            Setting::UnhideGames => {
+                for options in self.game_options.values_mut() {
+                    options.hidden = false;
+                }
+                self.message = emu::save_game_options(&self.game_options).err().unwrap_or_default();
+                self.rescan(cx);
+            }
+            Setting::ClearPcFolders => {
+                self.config.pc_folders.clear();
+                self.message = self.config.save().err().unwrap_or_default();
+                self.rescan(cx);
             }
             Setting::CoreList => {
                 self.settings_cat = 1;
@@ -1750,11 +1961,37 @@ impl Hub {
                 } else {
                     format!("Missing in {}: {}", emu::emulation_folder(&self.config).join("bios").display(), missing_bios.join("; "))
                 },
-            ));
+            ))
+            .child(
+                setting_row("Steam games", "Installed Steam games in PC Games. They start through Steam.")
+                    .child(self.setting_button(Setting::SteamGames, Button::new("steam-games").label(if self.config.hide_steam { "Off" } else { "On" }).selected(!self.config.hide_steam), cx)),
+            )
+            .child(
+                setting_row(
+                    "PC game folders",
+                    &format!(
+                        "Programs and shortcuts, or one subfolder per game. Always scans {}{}",
+                        self.config.roms_dir.join(emu::PC).display(),
+                        self.config.pc_folders.iter().map(|f| format!(", {}", f.display())).collect::<String>(),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(self.setting_button(Setting::AddPcFolder, Button::new("add-pc-folder").label("Add folder…"), cx))
+                        .child(self.setting_button(Setting::ClearPcFolders, Button::new("clear-pc-folders").label("Clear").disabled(self.config.pc_folders.is_empty()), cx)),
+                ),
+            )
+            .child({
+                let hidden = self.game_options.values().filter(|o| o.hidden).count();
+                setting_row("Hidden games", &format!("{hidden} hidden from their game pages."))
+                    .child(self.setting_button(Setting::UnhideGames, Button::new("unhide-games").label("Unhide all").disabled(hidden == 0), cx))
+            });
 
         let mut cores = card();
         for (i, core) in CORES.iter().enumerate() {
-            let systems: Vec<&str> = self.systems.iter().filter(|s| &s.core == core).map(|s| s.name.as_str()).collect();
+            let systems: Vec<&str> = self.systems.iter().filter(|s| &s.core == core || s.alts.contains(core)).map(|s| s.name.as_str()).collect();
             let installed = emu::core_installed(&self.config, core);
             let note = match (installed, systems.is_empty()) {
                 (true, false) => format!("Installed. {}", systems.join(", ")),

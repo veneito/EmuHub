@@ -20,6 +20,9 @@ const ICONS: &[(&str, &str)] = &[
     ("image", r#"<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5-9 9"/>"#),
     ("arrow-left", r#"<path d="M19 12H5m6-6-6 6 6 6"/>"#),
     ("refresh", r#"<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>"#),
+    ("edit", r#"<path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16z"/>"#),
+    ("gamepad", r#"<path d="M7 7h10a5 5 0 0 1 4.9 6l-.6 3a2.5 2.5 0 0 1-4.3 1.1L15 15H9l-2 2.1A2.5 2.5 0 0 1 2.7 16l-.6-3A5 5 0 0 1 7 7zM8 10v4m-2-2h4"/><circle cx="16" cy="11" r=".5"/><circle cx="18" cy="13" r=".5"/>"#),
+    ("eye-off", r#"<path d="M3 3l18 18M10.6 6.1A10 10 0 0 1 12 6c6 0 9.5 6 9.5 6a17 17 0 0 1-2.9 3.6M6.6 7.6A17 17 0 0 0 2.5 12S6 18 12 18a9.6 9.6 0 0 0 4.4-1.1M9.9 9.9a3 3 0 0 0 4.2 4.2"/>"#),
     // Controller button glyphs for the hints bar.
     ("btn-cross", r#"<path d="m7 7 10 10M17 7 7 17"/>"#),
     ("btn-circle", r#"<circle cx="12" cy="12" r="6.5"/>"#),

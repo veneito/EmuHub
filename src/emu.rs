@@ -22,6 +22,51 @@ pub struct System {
     /// BIOS files the core needs, relative to Emulation/bios.
     #[serde(default)]
     pub bios: Vec<String>,
+    /// Other cores or standalone emulator ids a game can be set to use instead, on its game page.
+    #[serde(default)]
+    pub alts: Vec<String>,
+}
+
+impl System {
+    /// The core or standalone emulator id games use unless set otherwise.
+    pub fn default_emulator(&self) -> &str {
+        if self.standalone.is_empty() { &self.core } else { &self.standalone }
+    }
+}
+
+/// Settings for one game, made on its game page. Saved by the game's scanned path.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct GameOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// A core or standalone emulator id instead of the system's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emulator: Option<String>,
+    /// PC games: the program to start instead of the one found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+}
+
+pub fn load_game_options() -> std::collections::HashMap<PathBuf, GameOptions> {
+    std::fs::read(config_dir().join("games.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+pub fn save_game_options(options: &std::collections::HashMap<PathBuf, GameOptions>) -> Result<(), String> {
+    // Games back at their defaults aren't kept.
+    let kept: std::collections::HashMap<_, _> = options.iter().filter(|(_, o)| **o != GameOptions::default()).collect();
+    write_atomic(&config_dir().join("games.json"), &serde_json::to_vec_pretty(&kept).unwrap())
+}
+
+/// Drops hidden games and uses the names set on game pages.
+pub fn apply_game_options(games: &mut Vec<Game>, options: &std::collections::HashMap<PathBuf, GameOptions>) {
+    games.retain(|g| !options.get(&g.path).is_some_and(|o| o.hidden));
+    for game in games.iter_mut() {
+        if let Some(name) = options.get(&game.path).and_then(|o| o.name.clone()) {
+            game.name = name;
+        }
+    }
 }
 
 /// The system's BIOS files that aren't in Emulation/bios.
@@ -45,6 +90,12 @@ pub struct Config {
     /// The update version the user chose to skip; it isn't offered again.
     #[serde(default)]
     pub skipped_update: Option<String>,
+    /// Leaves installed Steam games out of PC Games.
+    #[serde(default)]
+    pub hide_steam: bool,
+    /// More folders to scan for PC games, besides roms/pc.
+    #[serde(default)]
+    pub pc_folders: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -101,7 +152,7 @@ fn default_config(home: &Path) -> Config {
     let steamgriddb_key = String::new();
     if cfg!(target_os = "windows") {
         let ra = PathBuf::from(r"C:\RetroArch-Win64");
-        Config { roms_dir, retroarch_cmd: vec![ra.join("retroarch.exe").display().to_string()], cores_dir: ra.join("cores"), steamgriddb_key, emulators: Default::default(), skipped_update: None }
+        Config { roms_dir, retroarch_cmd: vec![ra.join("retroarch.exe").display().to_string()], cores_dir: ra.join("cores"), steamgriddb_key, emulators: Default::default(), skipped_update: None, hide_steam: false, pc_folders: Vec::new() }
     } else if cfg!(target_os = "macos") {
         Config {
             roms_dir,
@@ -110,6 +161,8 @@ fn default_config(home: &Path) -> Config {
             steamgriddb_key,
             emulators: Default::default(),
             skipped_update: None,
+            hide_steam: false,
+            pc_folders: Vec::new(),
         }
     } else {
         // SteamOS/EmuDeck installs RetroArch as a Flatpak.
@@ -120,6 +173,8 @@ fn default_config(home: &Path) -> Config {
             steamgriddb_key,
             emulators: Default::default(),
             skipped_update: None,
+            hide_steam: false,
+            pc_folders: Vec::new(),
         }
     }
 }
@@ -330,24 +385,27 @@ fn zapper_game(game: &Game) -> bool {
 
 /// Starts a game in RetroArch or its standalone emulator.
 pub fn launch(cfg: &Config, game: &Game) -> Result<Running, String> {
-    if game.system == STEAM {
-        return launch_steam(game);
+    let options = load_game_options().remove(&game.path).unwrap_or_default();
+    if game.system == PC {
+        return if steam_appid(game).is_some() { launch_steam(game) } else { launch_pc(game, options.program.as_deref()) };
     }
     let sys = systems().into_iter().find(|s| s.id == game.system).ok_or("unknown system")?;
-    if let Some(emu) = emulator(&sys.standalone) {
+    let choice = options.emulator.clone().unwrap_or_else(|| sys.default_emulator().to_owned());
+    if let Some(emu) = emulator(&choice) {
         let mut running = launch_standalone(cfg, emu, game)?;
         running.game = Some(game.path.clone());
         record_play(game);
         return Ok(running);
     }
-    if sys.core == "melondsds" {
+    if choice == "melondsds" {
         for dir in retroarch_save_dirs(cfg) {
             // Best effort: a failed copy only means the game starts without its old save.
             let _ = move_melonds_save(&dir, game);
         }
     }
-    let zapper = zapper_game(game);
-    let core = cfg.cores_dir.join(core_file(if zapper { ZAPPER_CORE } else { &sys.core }));
+    // A core picked on the game page wins over the Zapper core.
+    let zapper = options.emulator.is_none() && zapper_game(game);
+    let core = cfg.cores_dir.join(core_file(if zapper { ZAPPER_CORE } else { &choice }));
     if !core.exists() {
         return Err(format!("Core not found: {}. Use Settings → Install cores.", core.display()));
     }
@@ -402,8 +460,12 @@ input_player2_gun_trigger_mbtn = \"1\"
 
 // ---- Steam -----------------------------------------------------------------
 
-/// The systems.json id for installed Steam games. Their path is the game's appmanifest_<appid>.acf.
-pub const STEAM: &str = "steam";
+/// The systems.json id for PC games: installed Steam games (their path is the game's appmanifest_<appid>.acf),
+/// plus programs and shortcuts in roms/pc and the folders picked in Settings.
+pub const PC: &str = "pc";
+
+/// Files that are a PC game on their own.
+const PC_EXTS: [&str; 5] = ["exe", "lnk", "url", "desktop", "appimage"];
 
 /// Steam's own folder, holding steamapps/libraryfolders.vdf.
 fn steam_dir() -> PathBuf {
@@ -444,14 +506,82 @@ pub fn steam_games() -> Vec<Game> {
             if ["Proton", "Steam Linux Runtime", "Steamworks"].iter().any(|tool| name.starts_with(tool)) {
                 continue;
             }
-            games.push(Game { system: STEAM.to_owned(), name, path });
+            games.push(Game { system: PC.to_owned(), name, path });
         }
     }
     games
 }
 
+/// Every PC game: Steam's (unless hidden), then roms/pc and the picked folders. In those folders a loose
+/// program or shortcut is a game, and so is each subfolder (a copied game), started by its main .exe.
+pub fn pc_games(cfg: &Config) -> Vec<Game> {
+    let mut games = if cfg.hide_steam { Vec::new() } else { steam_games() };
+    for folder in std::iter::once(cfg.roms_dir.join(PC)).chain(cfg.pc_folders.iter().cloned()) {
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        for path in entries.flatten().map(|e| e.path()) {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if path.is_dir() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                if let Some(exe) = main_exe(&path) {
+                    games.push(Game { system: PC.to_owned(), name, path: exe });
+                }
+            } else if PC_EXTS.contains(&ext.as_str()) {
+                let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                games.push(Game { system: PC.to_owned(), name, path });
+            }
+        }
+    }
+    games
+}
+
+/// A game folder's main program: .exe files up to two folders deep, minus installers and helpers;
+/// one named like the folder wins, else the biggest.
+// shortcut: Windows .exe only; Linux-native game folders need a shortcut in roms/pc.
+fn main_exe(dir: &Path) -> Option<PathBuf> {
+    const SKIP: [&str; 12] = ["unins", "setup", "install", "redist", "vc_", "dxsetup", "crash", "prereq", "dotnet", "directx", "helper", "update"];
+    let squash = |s: &str| s.to_lowercase().replace([' ', '-', '_'], "");
+    let folder = squash(&dir.file_name()?.to_string_lossy());
+    let mut exes = Vec::new();
+    let mut dirs = vec![(dir.to_path_buf(), 0)];
+    while let Some((d, depth)) = dirs.pop() {
+        for path in std::fs::read_dir(&d).into_iter().flatten().flatten().map(|e| e.path()) {
+            if path.is_dir() && depth < 2 {
+                dirs.push((path, depth + 1));
+            } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
+                if !SKIP.iter().any(|s| stem.contains(s)) {
+                    let size = path.metadata().map_or(0, |m| m.len());
+                    exes.push((squash(&stem) == folder, size, path));
+                }
+            }
+        }
+    }
+    exes.into_iter().max_by_key(|(named, size, _)| (*named, *size)).map(|(_, _, path)| path)
+}
+
+/// Starts a PC game: a program directly (from its own folder, so it finds its files), anything else with the system opener.
+/// `chosen` is a program picked on the game page instead of the one found.
+fn launch_pc(game: &Game, chosen: Option<&Path>) -> Result<Running, String> {
+    let path = chosen.unwrap_or(&game.path);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let program = (cfg!(target_os = "windows") && ext == "exe") || ext == "appimage";
+    let child = if program {
+        Command::new(path).current_dir(path.parent().unwrap_or(Path::new("."))).spawn()
+    } else {
+        let opener = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        Command::new(opener).arg(path).spawn()
+    }
+    .map_err(|e| format!("Could not start {}: {e}", game.name))?;
+    record_play(game);
+    // Only a program started here is tracked; a shortcut's opener exits right away.
+    Ok(Running { child, close_on_combo: program, game: program.then(|| game.path.clone()), started: std::time::Instant::now() })
+}
+
 /// The Steam app id from a Steam game's path (appmanifest_413150.acf → 413150).
 fn steam_appid(game: &Game) -> Option<String> {
+    if !game.path.extension().is_some_and(|e| e == "acf") {
+        return None;
+    }
     let stem = game.path.file_stem()?.to_str()?;
     stem.strip_prefix("appmanifest_").map(str::to_owned)
 }
@@ -702,6 +832,15 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("part");
     std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Every core systems.json lists, alternates included, for the Cores list.
+pub fn all_cores() -> Vec<String> {
+    let mut cores = needed_cores();
+    cores.extend(systems().into_iter().flat_map(|s| s.alts).filter(|a| emulator(a).is_none()));
+    cores.sort();
+    cores.dedup();
+    cores
 }
 
 /// Every core systems.json needs, without duplicates.
@@ -966,7 +1105,7 @@ pub fn fetch_cover(game: &Game, steamgriddb_key: &str) -> bool {
         return false;
     }
     let Some(sys) = systems().into_iter().find(|s| s.id == game.system) else { return false };
-    if let Some(appid) = steam_appid(game).filter(|_| game.system == STEAM) {
+    if let Some(appid) = steam_appid(game) {
         // Steam's own portrait cover; SteamGridDB below if a game has none.
         if let Ok(bytes) = download(&format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"), None) {
             return write_atomic(&default_cover(game), &shrink_cover(&bytes)).is_ok();
@@ -1152,6 +1291,33 @@ mod tests {
     }
 
     #[test]
+    fn picks_a_game_folders_main_exe() {
+        let dir = std::env::temp_dir().join("emuhub_pc_test").join("Hollow Knight");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        std::fs::create_dir_all(dir.join("_redist")).unwrap();
+        std::fs::write(dir.join("unins000.exe"), vec![0; 900]).unwrap();
+        std::fs::write(dir.join("UnityCrashHandler64.exe"), vec![0; 800]).unwrap();
+        std::fs::write(dir.join("_redist/vcredist_x64.exe"), vec![0; 700]).unwrap();
+        std::fs::write(dir.join("big_tool.exe"), vec![0; 500]).unwrap();
+        std::fs::write(dir.join("hollow_knight.exe"), vec![0; 100]).unwrap();
+        assert_eq!(super::main_exe(&dir), Some(dir.join("hollow_knight.exe")));
+        std::fs::remove_file(dir.join("hollow_knight.exe")).unwrap();
+        assert_eq!(super::main_exe(&dir), Some(dir.join("big_tool.exe")));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn game_options_hide_and_rename() {
+        let game = |name: &str| super::Game { system: "gba".into(), name: name.into(), path: format!("roms/gba/{name}.gba").into() };
+        let mut games = vec![game("Advance Wars"), game("Golden Sun"), game("Tool")];
+        let mut options = std::collections::HashMap::new();
+        options.insert(PathBuf::from("roms/gba/Tool.gba"), super::GameOptions { hidden: true, ..Default::default() });
+        options.insert(PathBuf::from("roms/gba/Golden Sun.gba"), super::GameOptions { name: Some("Golden Sun (EN)".into()), ..Default::default() });
+        super::apply_game_options(&mut games, &options);
+        assert_eq!(games.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["Advance Wars", "Golden Sun (EN)"]);
+    }
+
+    #[test]
     fn reads_vdf_values() {
         let vdf = r#""libraryfolders"
 {
@@ -1166,7 +1332,7 @@ mod tests {
 	}
 }"#;
         assert_eq!(super::vdf_values(vdf, "path"), [r"C:\Program Files (x86)\Steam", r"D:\SteamLibrary"]);
-        let game = super::Game { system: "steam".into(), name: "Stardew Valley".into(), path: "x/appmanifest_413150.acf".into() };
+        let game = super::Game { system: "pc".into(), name: "Stardew Valley".into(), path: "x/appmanifest_413150.acf".into() };
         assert_eq!(super::steam_appid(&game).as_deref(), Some("413150"));
     }
 
